@@ -6,12 +6,12 @@ with a real message + propagated exit code.
 
 ## Setup
 ```
-pip install paramiko
-copy vmconfig.example.json vmconfig.json
-# edit vmconfig.json: vmx path, host IP, snapshot name, per-user passwords
+pip install -r requirements.txt             # just paramiko
+copy vmconfig.example.json vmconfig.json    # edit: host IP, vmx path, passwords
+python vm.py vm doctor                      # all checks should PASS
 ```
 `vmconfig.json` is gitignored (holds passwords). `default_vm` in config is used when `--vm` is
-omitted.
+omitted. To wire the tool into Claude Code or another coding agent, see `INSTALL.md`.
 
 ## Verbs
 
@@ -46,6 +46,17 @@ omitted.
 - `124` = timeout.
 - `125` = can't connect / config error.
 - `0` = success (other verbs).
+
+## If a command fails, do this
+| symptom | action |
+|---|---|
+| exit `125` (can't connect) | `python vm.py vm ip --save` then retry once; still failing → `python vm.py vm doctor` |
+| exit `124` (timeout) | retry with a bigger `--timeout N`; if it repeats, the command is hanging — report it |
+| nonzero rc from `run`/`build-run` | that is the remote command's own exit code — read the printed stderr |
+| `vm doctor` shows a `[FAIL]` | fix that one line (config value, vmrun path, credentials); don't retry other verbs first |
+| VM is broken / reverted | use the `vm-recovery` skill (or: `vm reset`, then re-`sync`) |
+
+Do not retry the same failing command more than twice.
 
 ## No verb needed for a permission/read check
 ```

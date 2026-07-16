@@ -56,7 +56,12 @@ def load_config(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        die("config file not found: %s" % path)
+        msg = "config file not found: %s" % path
+        here = os.path.dirname(os.path.abspath(__file__))
+        if os.path.exists(os.path.join(here, "vmconfig.example.json")):
+            msg += ("\nfirst-time setup: copy vmconfig.example.json to vmconfig.json, "
+                    "fill in host/vmx/password, then run: python vm.py vm doctor")
+        die(msg)
     except json.JSONDecodeError as e:
         die("config file is not valid JSON: %s" % e)
 
