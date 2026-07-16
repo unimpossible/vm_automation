@@ -1,3 +1,8 @@
+---
+name: vm-recovery
+description: Recover a test VM to its clean snapshot and refresh its IP after a risky operation left it in a bad state, or when SSH/run fails following a revert. Uses the vm.py CLI (vm snapshot / vm reset / sync).
+---
+
 # Skill: VM recovery (snapshot/reset loop)
 
 **Symptom:** VM is in a bad state (broken by a risky test), or SSH/`run` fails after a

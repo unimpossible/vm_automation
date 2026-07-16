@@ -233,37 +233,59 @@ def _push_b64(client, vm, local, remote):
         die("base64 push decode failed: %s" % err.decode(errors="replace"))
 
 
-def cmd_push(client, vm, args):
-    local = args.local
-    if not os.path.isfile(local):
-        die("local file not found: %s" % local)
-    remote = args.remote
-    if not remote:
-        # default: staging_remote/<basename>, else /tmp/<basename>
-        staging = vm.get("staging_remote")
-        base = os.path.basename(local)
-        remote = posixpath.join(staging, base) if staging else "/tmp/" + base
-    sftp = _sftp_or_none(client)
-    used = "sftp"
+def _push_file(client, vm, local, remote, sftp):
+    """Upload one file; SFTP if available, base64-over-exec fallback. Returns method used."""
     if sftp is not None:
         try:
             parent = posixpath.dirname(remote)
             if parent:
-                exec_command(client, vm, "mkdir -p %s" % shlex.quote(parent),
-                             timeout=30)
+                exec_command(client, vm, "mkdir -p %s" % shlex.quote(parent), timeout=30)
             sftp.put(local, remote)
+            return "sftp"
         except Exception:
-            used = "base64"
-            _push_b64(client, vm, local, remote)
-        finally:
+            pass
+    _push_b64(client, vm, local, remote)
+    return "base64"
+
+
+def cmd_push(client, vm, args):
+    # cp-style: `push SRC... DEST`. One positional = single file with a default remote;
+    # two positionals = SRC DEST (a literal remote path); 3+ = SRC... DESTDIR (a directory).
+    paths = args.paths
+    if len(paths) == 1:
+        locals_, dest, multi = paths, None, False
+    else:
+        locals_, dest, multi = paths[:-1], paths[-1], len(paths) > 2
+
+    for lf in locals_:
+        if not os.path.isfile(lf):
+            die("local file not found: %s" % lf)
+
+    sftp = _sftp_or_none(client)
+    try:
+        if not multi:
+            local = locals_[0]
+            remote = dest
+            if not remote:
+                # default: staging_remote/<basename>, else /tmp/<basename>
+                staging = vm.get("staging_remote")
+                base = os.path.basename(local)
+                remote = posixpath.join(staging, base) if staging else "/tmp/" + base
+            used = _push_file(client, vm, local, remote, sftp)
+            status("pushed %s -> %s (%s)" % (local, remote, used))
+        else:
+            # multiple sources -> dest is a remote directory
+            exec_command(client, vm, "mkdir -p %s" % shlex.quote(dest), timeout=30)
+            for lf in locals_:
+                remote = posixpath.join(dest, os.path.basename(lf))
+                _push_file(client, vm, lf, remote, sftp)
+            status("pushed %d file(s) -> %s" % (len(locals_), dest))
+    finally:
+        if sftp is not None:
             try:
                 sftp.close()
             except Exception:
                 pass
-    else:
-        used = "base64"
-        _push_b64(client, vm, local, remote)
-    status("pushed %s -> %s (%s)" % (local, remote, used))
     return 0
 
 
@@ -362,12 +384,23 @@ def cmd_build_run(client, vm, args):
         die("local source not found: %s" % local)
     ext = os.path.splitext(local)[1].lower()
     base = os.path.basename(local)
+    stem = os.path.splitext(base)[0] or "a"
 
-    # unique remote paths so concurrent agents don't collide
-    rc, out, err = exec_command(client, vm, "mktemp -d /tmp/vmbuild.XXXXXX", timeout=30)
-    if rc != 0:
-        die("mktemp failed: %s" % err.decode(errors="replace"))
-    workdir = out.decode().strip()
+    # --dir: build into a caller-chosen remote dir and leave artifacts there.
+    # Otherwise use a unique temp dir so concurrent agents don't collide.
+    user_dir = args.dir
+    if user_dir:
+        workdir = user_dir
+        rc, out, err = exec_command(client, vm, "mkdir -p %s" % shlex.quote(workdir), timeout=30)
+        if rc != 0:
+            die("could not create --dir %s: %s" % (workdir, err.decode(errors="replace")))
+    else:
+        rc, out, err = exec_command(client, vm, "mktemp -d /tmp/vmbuild.XXXXXX", timeout=30)
+        if rc != 0:
+            die("mktemp failed: %s" % err.decode(errors="replace"))
+        workdir = out.decode().strip()
+    # Keep artifacts when the caller named the dir (that's the point) or asked with --keep.
+    keep = args.keep or bool(user_dir)
     remote_src = posixpath.join(workdir, base)
 
     # upload source (sftp with base64 fallback)
@@ -392,14 +425,14 @@ def cmd_build_run(client, vm, args):
     if ext in (".sh", ".py"):
         exec_command(client, vm, "sed -i 's/\\r$//' " + shlex.quote(remote_src), timeout=30)
 
-    tmp_bin = posixpath.join(workdir, "a.out")
+    tmp_bin = posixpath.join(workdir, stem)
     build = _build_cmd(remote_src, ext, tmp_bin)
     if build is not None:
         rc, out, err = exec_command(client, vm, build, timeout=args.timeout)
         if rc != 0:
             sys.stderr.buffer.write(err)
             sys.stderr.buffer.flush()
-            _cleanup(client, vm, workdir, args.keep)
+            _cleanup(client, vm, workdir, keep)
             die("compile failed (rc=%d)" % rc, code=rc if rc else 1)
         target = tmp_bin
     else:
@@ -409,7 +442,7 @@ def cmd_build_run(client, vm, args):
         elif ext == ".sh":
             target = "bash " + shlex.quote(remote_src)
         else:
-            _cleanup(client, vm, workdir, args.keep)
+            _cleanup(client, vm, workdir, keep)
             die("don't know how to build/run %s" % ext)
 
     arg_str = " ".join(shlex.quote(a) for a in (args.args or []))
@@ -423,7 +456,7 @@ def cmd_build_run(client, vm, args):
         rc, out, err = exec_command(
             client, vm, run_cmd, as_user=args.as_user, timeout=args.timeout)
     except TimeoutError as e:
-        _cleanup(client, vm, workdir, args.keep)
+        _cleanup(client, vm, workdir, keep)
         die(str(e), EXIT_TIMEOUT)
 
     sys.stdout.buffer.write(out)
@@ -431,7 +464,7 @@ def cmd_build_run(client, vm, args):
     if err:
         sys.stderr.buffer.write(err)
         sys.stderr.buffer.flush()
-    _cleanup(client, vm, workdir, args.keep)
+    _cleanup(client, vm, workdir, keep)
     return rc
 
 
@@ -808,9 +841,10 @@ def build_parser():
     s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="command timeout (s)")
 
     # push
-    s = sub.add_parser("push", help="upload a file (SFTP, base64 fallback)")
-    s.add_argument("local")
-    s.add_argument("remote", nargs="?", help="remote path (default: staging_remote/basename)")
+    s = sub.add_parser("push", help="upload file(s) (SFTP, base64 fallback)")
+    s.add_argument("paths", nargs="+", metavar="SRC... [DEST]",
+                   help="cp-style: one file uses a default remote; SRC DEST sets a remote path; "
+                        "SRC... DESTDIR pushes many files into a remote directory")
 
     # pull
     s = sub.add_parser("pull", help="download a file (SFTP, base64 fallback)")
@@ -829,6 +863,9 @@ def build_parser():
     s.add_argument("--args", nargs=argparse.REMAINDER, default=[],
                    help="arguments passed to the program (must be last)")
     s.add_argument("--keep", action="store_true", help="keep the temp build dir on the VM")
+    s.add_argument("--dir", metavar="REMOTE",
+                   help="build in this remote dir (created if needed) and leave artifacts there, "
+                        "instead of a temp dir")
     s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="build/run timeout (s)")
 
     # snap

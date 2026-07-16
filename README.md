@@ -19,10 +19,10 @@ omitted.
 | verb | args | purpose |
 |---|---|---|
 | `run` | `"<cmd>" [--as USER] [--timeout N]` | exec cmd, print stdout/stderr, exit=remote rc |
-| `push` | `<local> [remote]` | upload (SFTP, auto base64 fallback) |
+| `push` | `<src>... [dest]` | upload, cp-style (SFTP, auto base64 fallback) |
 | `pull` | `<remote> [local]` | download (SFTP, auto base64 fallback) |
 | `sync` | `<localdir> [remotedir]` | bulk push a staging dir |
-| `build-run` | `<local-src> [--as USER] [--args ...] [--keep]` | push+compile(gcc)+run source in a temp dir, one call |
+| `build-run` | `<local-src> [--as USER] [--dir REMOTE] [--keep] [--args ...]` | push+compile(gcc)+run source, one call |
 | `snap` | `<path>` | print baseline line `inode mtime size sha256` |
 | `verify` | `<path> --baseline "<line>" [--token STR]` | print CREATED\|MODIFIED\|UNCHANGED + token check |
 | `waitfile` | `<path> [--timeout N]` | block until file exists/changes |
@@ -56,11 +56,20 @@ python vm.py run "head -c 64 <path>" --as USER
 `snap` prints a baseline line only — nothing stored on disk. Pass it back via
 `verify <path> --baseline "<line>"`. Safe for concurrent agents (no shared state file).
 
+## Transferring multiple files
+`push` is cp-style. One source uses a default remote; `SRC DEST` sets a literal remote path;
+`SRC... DESTDIR` pushes many files into a remote directory (shell globs work):
+```
+python vm.py push ./a.txt /home/user/a.txt          # single, explicit path
+python vm.py push ./a.c ./b.c ./data /home/user/in/  # many files -> a remote dir
+```
+For a whole tree, use `sync <localdir> [remotedir]` (recursive, defaults from config staging).
+
 ## build-run working dir
-`build-run` pushes the source and builds in a fresh `/tmp/vmbuild.XXXXXX` dir (unique per run, so
-concurrent agents don't collide) and removes it afterward. Pass `--keep` to leave it in place (the
-path is printed to stderr). It does not build into a caller-chosen directory — if the artifact must
-live at a specific path, use `push` + `run "gcc ..."` instead.
+By default `build-run` builds in a fresh `/tmp/vmbuild.XXXXXX` dir (unique per run so concurrent
+agents don't collide) and removes it afterward; `--keep` leaves it (path printed to stderr). Pass
+`--dir REMOTE` to build into a chosen dir (created if needed) and leave the source + binary there —
+the binary is named after the source stem (`widget.c` → `widget`).
 
 ## Git Bash / MSYS path gotcha
 On Git Bash/MSYS, an absolute POSIX **remote** path in `push`/`pull` (e.g. `/home/user/x`) gets
@@ -74,6 +83,8 @@ MSYS_NO_PATHCONV=1 python vm.py push ./x /home/user/x
 ```
 python vm.py run "id" --as admin
 python vm.py build-run ./test.c --args "1 2 3"
+python vm.py build-run ./test.c --dir /home/user/build   # leaves source + binary there
 python vm.py push ./out.bin /tmp/out.bin && python vm.py run "wc -c /tmp/out.bin"
+python vm.py push ./a.c ./b.c /home/user/src/            # multiple files in one call
 python vm.py vm reset
 ```

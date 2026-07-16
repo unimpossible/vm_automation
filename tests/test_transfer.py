@@ -1,4 +1,7 @@
-"""Coverage 5: push a local file, confirm byte count on the VM, pull it back, compare bytes."""
+"""Coverage 5: push a local file, confirm byte count on the VM, pull it back, compare bytes.
+
+Also covers cp-style multi-file push (`push SRC... DESTDIR`).
+"""
 
 import os
 
@@ -25,3 +28,26 @@ def test_push_wc_pull_roundtrip(run_vm, run_dir, tmp_path):
     assert rc == 0, "pull failed rc=%d stderr=%r" % (rc, err)
     assert pulled.read_bytes() == payload, "pulled bytes differ from original"
     assert os.path.getsize(str(pulled)) == len(payload)
+
+
+def test_push_multiple_files_into_dir(run_vm, run_dir, tmp_path):
+    """cp-style `push SRC... DESTDIR` uploads several files into one remote directory."""
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    c = tmp_path / "c.txt"
+    a.write_bytes(b"aaaaa")        # 5
+    b.write_bytes(b"bb")           # 2
+    c.write_bytes(b"cccc\n")       # 5
+    destdir = "%s/multi" % run_dir
+
+    rc, out, err = run_vm(
+        ["push", str(a), str(b), str(c), destdir], timeout=60)
+    assert rc == 0, "multi push failed rc=%d stderr=%r" % (rc, err)
+
+    # all three basenames must exist under destdir with correct sizes
+    rc, out, err = run_vm(
+        ["run", "wc -c %s/a.txt %s/b.txt %s/c.txt" % (destdir, destdir, destdir)], timeout=30)
+    assert rc == 0, "wc failed rc=%d stderr=%r" % (rc, err)
+    sizes = {ln.split()[1].rsplit("/", 1)[-1]: int(ln.split()[0])
+             for ln in out.strip().splitlines() if "total" not in ln}
+    assert sizes == {"a.txt": 5, "b.txt": 2, "c.txt": 5}, "unexpected sizes: %r" % sizes

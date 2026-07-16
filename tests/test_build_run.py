@@ -76,3 +76,21 @@ def test_build_run_keep_leaves_tempdir(run_vm, tmp_path):
     finally:
         # Be tidy: remove the kept dir even though it lives under /tmp (build-run's own space).
         run_vm(["run", "rm -rf %s" % workdir], timeout=30)
+
+
+def test_build_run_dir_leaves_artifacts(run_vm, run_dir, tmp_path):
+    """--dir builds into a caller-chosen remote dir and leaves source + binary there."""
+    src = tmp_path / "widget.c"
+    src.write_text(C_UID)
+    destdir = "%s/build_here" % run_dir
+
+    rc, out, err = run_vm(["build-run", str(src), "--dir", destdir], timeout=90)
+    assert rc == 0, "build-run --dir rc=%d stderr=%r" % (rc, err)
+    assert "uid=1000" in out, "expected program output, got %r" % out
+
+    # source and the stem-named binary must both remain in the chosen dir
+    rc, out, err = run_vm(["run", "ls -1 %s" % destdir], timeout=30)
+    assert rc == 0, "ls failed rc=%d stderr=%r" % (rc, err)
+    listing = out.split()
+    assert "widget.c" in listing, "source missing from --dir: %r" % listing
+    assert "widget" in listing, "compiled binary (stem name) missing from --dir: %r" % listing
