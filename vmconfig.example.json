@@ -1,0 +1,20 @@
+{
+  "vmrun": "C:\\Program Files (x86)\\VMware\\VMware Workstation\\vmrun.exe",
+  "default_vm": "myvm",
+  "vms": {
+    "myvm": {
+      "os": "linux",
+      "host": "192.168.0.100",
+      "vmx": "E:\\Path\\To\\VMs\\myvm\\myvm.vmx",
+      "snapshot": "clean",
+      "default_user": "user",
+      "users": {
+        "user": {"password": "CHANGE_ME", "sudo": true},
+        "admin": {"password": "CHANGE_ME"}
+      },
+      "staging_local": ".\\staging",
+      "staging_remote": "/home/user/staging",
+      "wsl_distro": ""
+    }
+  }
+}
