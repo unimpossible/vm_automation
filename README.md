@@ -22,7 +22,7 @@ omitted.
 | `push` | `<local> [remote]` | upload (SFTP, auto base64 fallback) |
 | `pull` | `<remote> [local]` | download (SFTP, auto base64 fallback) |
 | `sync` | `<localdir> [remotedir]` | bulk push a staging dir |
-| `build-run` | `<local-src> [--as USER] [--args ...] [--keep]` | push+compile(gcc)+run source, one call |
+| `build-run` | `<local-src> [--as USER] [--args ...] [--keep]` | push+compile(gcc)+run source in a temp dir, one call |
 | `snap` | `<path>` | print baseline line `inode mtime size sha256` |
 | `verify` | `<path> --baseline "<line>" [--token STR]` | print CREATED\|MODIFIED\|UNCHANGED + token check |
 | `waitfile` | `<path> [--timeout N]` | block until file exists/changes |
@@ -55,6 +55,20 @@ python vm.py run "head -c 64 <path>" --as USER
 ## snap/verify are stateless
 `snap` prints a baseline line only — nothing stored on disk. Pass it back via
 `verify <path> --baseline "<line>"`. Safe for concurrent agents (no shared state file).
+
+## build-run working dir
+`build-run` pushes the source and builds in a fresh `/tmp/vmbuild.XXXXXX` dir (unique per run, so
+concurrent agents don't collide) and removes it afterward. Pass `--keep` to leave it in place (the
+path is printed to stderr). It does not build into a caller-chosen directory — if the artifact must
+live at a specific path, use `push` + `run "gcc ..."` instead.
+
+## Git Bash / MSYS path gotcha
+On Git Bash/MSYS, an absolute POSIX **remote** path in `push`/`pull` (e.g. `/home/user/x`) gets
+silently rewritten to a Windows path before `vm.py` sees it — the upload then "succeeds" at the wrong
+place. Prefix the command with `MSYS_NO_PATHCONV=1`, or just run from PowerShell (unaffected):
+```
+MSYS_NO_PATHCONV=1 python vm.py push ./x /home/user/x
+```
 
 ## Examples
 ```
