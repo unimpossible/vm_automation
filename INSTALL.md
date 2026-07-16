@@ -22,7 +22,7 @@ Three optional steps, each independent:
 ## Test VM
 Drive the test VM with `python vm.py <verb>` (run from E:\Projects\vm_automation).
 Read its README.md once for the verbs. Rules: confine guest writes to an agreed dir;
-never run `vm revert/reset/stop/snapshot` unless explicitly asked.
+never run `vm revert/reset/stop/snapshot` unless explicitly asked or your team wrecked the state.
 ```
 
 **2. Skip permission prompts** — in `.claude/settings.json` (project) or `~/.claude/settings.json`:

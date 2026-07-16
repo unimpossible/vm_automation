@@ -715,6 +715,30 @@ def cmd_vm_reset(cfg, vm, vm_name, args, config_path):
     return 0
 
 
+def _probe_user_sudo(vm, uname):
+    """SSH in as `uname` with their own password and test their own sudo rights.
+
+    True = the user can sudo (correct password accepted by sudo -S).
+    Raises on SSH/login failure (can't tell either way).
+    """
+    pw = user_password(vm, uname)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(hostname=vm.get("host"), username=uname, password=pw,
+                       timeout=CONNECT_TIMEOUT, banner_timeout=CONNECT_TIMEOUT,
+                       auth_timeout=CONNECT_TIMEOUT, look_for_keys=False,
+                       allow_agent=False)
+        rc, out, err = exec_command(client, vm, "sudo -S -p '' true",
+                                    timeout=30, stdin_data=(pw + "\n").encode())
+        return rc == 0
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
 def cmd_vm_doctor(cfg, vm, vm_name, args, config_path):
     """Per-check PASS/FAIL health report."""
     checks = []
@@ -750,7 +774,8 @@ def cmd_vm_doctor(cfg, vm, vm_name, args, config_path):
         ssh_detail = str(e)
     checks.append(("ssh connects", ssh_ok, ssh_detail))
 
-    # sudo works for each configured user
+    # per configured user: (a) `--as USER` impersonation works from default_user,
+    # (b) the user's own sudo rights match the config's `sudo` flag
     users = vm.get("users") or {}
     if ssh_ok:
         for uname in sorted(users):
@@ -763,10 +788,25 @@ def cmd_vm_doctor(cfg, vm, vm_name, args, config_path):
             except Exception as e:
                 ok = False
                 detail = str(e)
-            checks.append(("sudo as %s" % uname, ok, detail))
+            checks.append(("--as %s works" % uname, ok, detail))
+
+            if "sudo" in users[uname]:
+                expect = bool(users[uname]["sudo"])
+                try:
+                    has = _probe_user_sudo(vm, uname)
+                    ok = (has == expect)
+                    detail = ("has sudo" if has else "no sudo")
+                    if not ok:
+                        detail += " but config says sudo=%s" % str(expect).lower()
+                except Exception as e:
+                    ok = False
+                    detail = "probe failed: %s" % e
+                checks.append(("sudo as %s" % uname, ok, detail))
     else:
         for uname in sorted(users):
-            checks.append(("sudo as %s" % uname, False, "ssh down"))
+            checks.append(("--as %s works" % uname, False, "ssh down"))
+            if "sudo" in users[uname]:
+                checks.append(("sudo as %s" % uname, False, "ssh down"))
 
     if client is not None:
         try:

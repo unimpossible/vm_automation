@@ -1,7 +1,8 @@
 # vm.py — cheat sheet
 
-CLI to drive test VMs: guest control over SSH (paramiko) + host control over VMware (`vmrun`). One
-entrypoint: `python vm.py [--vm NAME] <verb> ...`. Success = one status line; errors go to stderr
+CLI to drive test VMs: guest control over SSH (paramiko) + host control over VMware (`vmrun`), primarily to be used by AI agents. 
+
+One entrypoint: `python vm.py [--vm NAME] <verb> ...`. Success = one status line; errors go to stderr
 with a real message + propagated exit code.
 
 ## Setup
@@ -37,7 +38,7 @@ omitted. To wire the tool into Claude Code or another coding agent, see `INSTALL
 | `vm list` | | list running VMs |
 | `vm snapshots` | | list snapshots |
 | `vm ip` | `[--save]` | discover guest IP, optionally write to config |
-| `vm doctor` | | health check: config, vmrun, vmx path, SSH, sudo per user |
+| `vm doctor` | | health check: config, vmrun, vmx, SSH; per user: `--as` works + sudo rights match config's `sudo` flag |
 
 **Optional (WSL):** `mount` / `umount` — sshfs live-bind VM staging dir via named WSL distro.
 
