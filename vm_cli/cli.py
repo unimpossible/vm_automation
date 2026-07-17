@@ -520,12 +520,20 @@ def cmd_build_run(client, vm, args):
             _cleanup(client, vm, workdir, keep)
             die("don't know how to build/run %s" % ext)
 
-    arg_str = " ".join(shlex.quote(a) for a in (args.args or []))
+    # A single --args value is a shell-style string: --args "1 2 3" means three
+    # arguments. Multiple values pass through literally, so an argument with an
+    # embedded space is still expressible: --args alpha "two words".
+    prog_args = list(args.args or [])
+    if len(prog_args) == 1:
+        prog_args = shlex.split(prog_args[0])
+    arg_str = " ".join(shlex.quote(a) for a in prog_args)
     if build is not None:
         run_cmd = "%s %s" % (shlex.quote(target), arg_str)
     else:
         run_cmd = "%s %s" % (target, arg_str)
-    run_cmd = run_cmd.strip()
+    # Run from the build dir so relative paths the program opens/creates land
+    # next to its artifacts (matters most with --dir).
+    run_cmd = "cd %s && %s" % (shlex.quote(workdir), run_cmd.strip())
 
     try:
         rc, out, err = exec_command(
@@ -608,15 +616,21 @@ def cmd_verify(client, vm, args):
 def cmd_waitfile(client, vm, args):
     path = args.path
     timeout = args.timeout
-    baseline = _snapshot(client, vm, path)
+    # A pre-existing file is stale state from an earlier run and would otherwise
+    # make waitfile silently wait for a *change* instead of creation (an easy
+    # race to lose given ~1-2s tool startup). Remove it and wait for the watched
+    # job to create it fresh, so waitfile always means "wait until it appears".
+    if _snapshot(client, vm, path) != "MISSING":
+        rc, out, err = exec_command(
+            client, vm, "rm -f -- %s" % shlex.quote(path), timeout=30)
+        if rc != 0:
+            die("waitfile: could not remove pre-existing %s: %s"
+                % (path, err.decode(errors="replace").strip()))
+        status("removed pre-existing %s; waiting for it to be recreated" % path)
     deadline = time.time() + timeout
     poll = 1.0
     while True:
-        current = _snapshot(client, vm, path)
-        if current != baseline and current != "MISSING":
-            status("changed: %s" % path)
-            return 0
-        if baseline == "MISSING" and current != "MISSING":
+        if _snapshot(client, vm, path) != "MISSING":
             status("appeared: %s" % path)
             return 0
         if time.time() >= deadline:
@@ -1236,7 +1250,8 @@ def build_parser():
     s.add_argument("source", help="local source file (.c/.cpp compiled; .sh/.py run directly)")
     s.add_argument("--as", dest="as_user", metavar="USER", help="run as another user via sudo")
     s.add_argument("--args", nargs=argparse.REMAINDER, default=[],
-                   help="arguments passed to the program (must be last)")
+                   help="arguments passed to the program (must be last); a single "
+                        "quoted value is split shell-style: --args \"1 2 3\" = 3 args")
     s.add_argument("--keep", action="store_true", help="keep the temp build dir on the VM")
     s.add_argument("--dir", metavar="REMOTE",
                    help="build in this remote dir (created if needed) and leave artifacts there, "
@@ -1254,7 +1269,9 @@ def build_parser():
     s.add_argument("--token", help="also report whether this token appears in file content")
 
     # waitfile
-    s = sub.add_parser("waitfile", help="block until a file exists/changes")
+    s = sub.add_parser("waitfile",
+                       help="block until a file appears (a pre-existing file is "
+                            "removed first, then watched for recreation)")
     s.add_argument("path")
     s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="max wait (s)")
 

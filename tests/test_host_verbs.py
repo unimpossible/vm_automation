@@ -4,7 +4,7 @@ STRICT: only read-only host verbs are exercised here. This suite never calls
 revert/reset/stop/start/snapshot against the user's live VM.
 """
 
-from conftest import EXPECTED_HOST
+from conftest import EXPECTED_HOST, EXPECTED_VMX
 
 
 def _passed_lines(stdout):
@@ -38,10 +38,11 @@ def test_vm_ip_reports_expected_host(run_vm):
 
 
 def test_vm_list_shows_vmx(run_vm):
-    """`vm list` -> rc 0 and the running inventory includes ubuntu24.vmx."""
+    """`vm list` -> rc 0 and the running inventory includes the picked VM's .vmx."""
     rc, out, err = run_vm(["vm", "list"], timeout=60)
     assert rc == 0, "vm list rc=%d stderr=%r" % (rc, err)
-    assert "ubuntu24.vmx" in out, "ubuntu24.vmx not listed as running; got %r" % out
+    assert EXPECTED_VMX, "config has no vmx for the picked VM"
+    assert EXPECTED_VMX in out, "%s not listed as running; got %r" % (EXPECTED_VMX, out)
 
 
 def test_vm_snapshots_runs(run_vm):

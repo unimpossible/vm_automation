@@ -35,7 +35,7 @@ into Claude Code or another coding agent, see `INSTALL.md`.
 | `build-run` | `<local-src> [--as USER] [--dir REMOTE] [--keep] [--args ...]` | push+compile(gcc)+run source, one call |
 | `snap` | `<path>` | print baseline line `inode mtime size sha256` |
 | `verify` | `<path> --baseline "<line>" [--token STR]` | print CREATED\|MODIFIED\|UNCHANGED + token check |
-| `waitfile` | `<path> [--timeout N]` | block until file exists/changes |
+| `waitfile` | `<path> [--timeout N]` | block until file appears (pre-existing file is deleted first, then watched for recreation) |
 
 **Host (vmrun):**
 | verb | args | purpose |
@@ -58,7 +58,7 @@ into Claude Code or another coding agent, see `INSTALL.md`.
 Drop files into `provision/<vm-name>/` (or `provision/<os>/`) in your project directory (beside
 `vmconfig.json`). On the first guest command they're synced to the guest tools dir (`tools_remote`, default `<home>/tools`),
 made executable on Linux, and that dir is prepended to `PATH` for `run` — so
-`provision/ubuntu24/strace` makes `run "strace -V"` work. No manifest; the folder is the config.
+`provision/myvm/strace` makes `run "strace -V"` work. No manifest; the folder is the config.
 
 - **Setup hook:** an optional `setup.sh` (Linux) or `setup.ps1` (Windows) at the folder root runs
   once after the copy, for anything a plain copy can't do. `setup.ps1` runs **elevated** over the
@@ -120,12 +120,25 @@ For a whole tree, use `sync <localdir> [remotedir]` (recursive, defaults from co
 By default `build-run` builds in a fresh `/tmp/vmbuild.XXXXXX` dir (unique per run so concurrent
 agents don't collide) and removes it afterward; `--keep` leaves it (path printed to stderr). Pass
 `--dir REMOTE` to build into a chosen dir (created if needed) and leave the source + binary there —
-the binary is named after the source stem (`widget.c` → `widget`).
+the binary is named after the source stem (`widget.c` → `widget`). The program runs **with the
+build dir as its cwd**, so relative paths it opens/creates land next to its artifacts.
+
+## build-run --args
+A single `--args` value is split shell-style: `--args "1 2 3"` passes **three** arguments.
+Multiple values pass through literally, so `--args alpha "two words"` passes two arguments,
+the second containing a space.
+
+## waitfile deletes a pre-existing target
+`waitfile <path>` means "wait until the watched job creates this file". If the file already
+exists when waitfile starts (stale output from an earlier run), it is deleted first and then
+watched for recreation — so start your job, then call waitfile, in either order.
 
 ## Git Bash / MSYS path gotcha
-On Git Bash/MSYS, an absolute POSIX **remote** path in `push`/`pull` (e.g. `/home/user/x`) gets
-silently rewritten to a Windows path before `vm` sees it — the upload then "succeeds" at the wrong
-place. Prefix the command with `MSYS_NO_PATHCONV=1`, or just run from PowerShell (unaffected):
+On Git Bash/MSYS, an absolute POSIX **remote** path in ANY verb that takes one — `push`, `pull`,
+`snap`, `verify`, `waitfile`, `build-run --dir` — gets silently rewritten to a Windows path before
+`vm` sees it (a `snap` will just print `MISSING` for a file that exists). **Local** paths are the
+mirror image: use native Windows form (`C:\Users\...`), not `/c/Users/...`. Prefix the command
+with `MSYS_NO_PATHCONV=1`, or just run from PowerShell (unaffected):
 ```
 MSYS_NO_PATHCONV=1 vm push ./x /home/user/x
 ```

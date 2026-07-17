@@ -2,7 +2,10 @@
 
 import time
 
+import pytest
 
+
+@pytest.mark.offline
 def test_unreachable_host_exits_125_fast(run_vm, bad_host_config):
     """Pointing --config at an unroutable host must fail with rc 125 within ~15s."""
     start = time.time()

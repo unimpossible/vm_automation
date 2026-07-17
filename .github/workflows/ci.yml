@@ -25,12 +25,8 @@ jobs:
       - name: Install package with test extras
         run: python -m pip install -e ".[test]"
 
-      # The suite drives a live VM and skips itself when none is reachable
-      # (always the case in CI). A real config isn't committed, so point the
-      # tests at the example config; the session probe then skips cleanly.
-      - name: Provide config for the test suite
-        run: cp vmconfig.example.json vmconfig.json
-
+      # Tests marked `offline` run here for real; the live-VM tests skip
+      # themselves with a clear reason (no vmconfig.json / VM unreachable).
       - name: Run tests
         run: python -m pytest tests/ -v
 

@@ -7,14 +7,14 @@ connects (and are made executable on Linux). No manifest — the folder *is* the
 
 ```
 provision/
-  <vm-name>/     # e.g. ubuntu24/  — matches the VM name in vmconfig.json (preferred)
+  <vm-name>/     # e.g. myvm/  — matches the VM name in vmconfig.json (preferred)
   <os>/          # e.g. linux/ or windows/  — fallback when there's no per-VM folder
 ```
 
 For a given VM, vm.py uses `provision/<vm-name>/` if it exists, else `provision/<os>/`.
 Everything in that folder is synced (recursively) to the guest **tools dir**
 (`tools_remote` in config, default `<home>/tools`), which `run` automatically prepends
-to `PATH`. So `provision/ubuntu24/strace` → `run "strace -V"` just works.
+to `PATH`. So `provision/myvm/strace` → `run "strace -V"` just works.
 
 ## Optional setup script
 
