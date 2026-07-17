@@ -8,9 +8,14 @@ with a real message + propagated exit code.
 ## Setup
 ```
 pip install -r requirements.txt             # just paramiko
-copy vmconfig.example.json vmconfig.json    # edit: host IP, vmx path, passwords
+python init.py                              # pick your VMs; writes config + folders
 python vm.py vm doctor                      # all checks should PASS
 ```
+`init.py` is interactive: it finds the VMs VMware knows about (running + registered), auto-detects
+each guest's OS and IP, prompts for user/password/snapshot, and writes `vmconfig.json` plus the
+`staging/` and `provision/` folders. Re-run it any time to add more VMs (it merges). To fill in a
+config by hand instead, `copy vmconfig.example.json vmconfig.json` and edit.
+
 `vmconfig.json` is gitignored (holds passwords). `default_vm` in config is used when `--vm` is
 omitted. To wire the tool into Claude Code or another coding agent, see `INSTALL.md`.
 
@@ -40,7 +45,38 @@ omitted. To wire the tool into Claude Code or another coding agent, see `INSTALL
 | `vm ip` | `[--save]` | discover guest IP, optionally write to config |
 | `vm doctor` | | health check: config, vmrun, vmx, SSH; per user: `--as` works + sudo rights match config's `sudo` flag |
 
+| `vm setup-ssh` | | (Windows guest) enable OpenSSH Server over VMware Tools; idempotent |
+| `vm provision` | `[--force]` | stage `provision/<vm\|os>/` into the guest tools dir; run its setup script |
+
 **Optional (WSL):** `mount` / `umount` — sshfs live-bind VM staging dir via named WSL distro.
+
+## Provisioning (staging tools into the guest)
+
+Drop files into `provision/<vm-name>/` (or `provision/<os>/`) next to `vm.py`. On the first
+guest command they're synced to the guest tools dir (`tools_remote`, default `<home>/tools`),
+made executable on Linux, and that dir is prepended to `PATH` for `run` — so
+`provision/ubuntu24/strace` makes `run "strace -V"` work. No manifest; the folder is the config.
+
+- **Setup hook:** an optional `setup.sh` (Linux) or `setup.ps1` (Windows) at the folder root runs
+  once after the copy, for anything a plain copy can't do. `setup.ps1` runs **elevated** over the
+  VMware Tools channel (where an MSVC/Build Tools installer belongs — SSH can't elevate).
+- **Idempotent:** a hash marker (`<tools>/.provisioned`) skips unchanged folders; edit the folder
+  and the next command auto-restages. Force with `vm provision --force`.
+- **Bake it in:** provision once, then `vm snapshot clean`, so every `vm reset` restores a
+  fully-loaded guest for free. See `provision/README.md`.
+
+## Windows guests
+
+Set `"os": "windows"` on the VM block (see `mywinvm` in `vmconfig.example.json`). Windows has no
+SSH by default, so the first guest command needs OpenSSH turned on inside the VM. vm.py does this
+for you over VMware Tools — no manual step:
+
+- It happens **automatically** the first time an SSH verb can't connect (you'll see
+  `enabling OpenSSH in the Windows guest...`), or run it explicitly with `vm setup-ssh`.
+- Requirements: VMware Tools running in the guest, and `default_user` is a **local admin**
+  (the modern.ie test VMs' `IEUser` / `Passw0rd!` qualifies).
+- Use forward slashes in remote paths (`C:/Users/IEUser/staging`). `run` executes in `cmd.exe`.
+- `push` / `pull` / `sync` / `run` work. `build-run`, `--as`, and sudo are Linux-only.
 
 ## Exit codes
 - Remote command's rc passes through for `run` / `build-run`.

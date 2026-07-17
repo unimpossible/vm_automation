@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 staging/
+
+# Staged tool binaries can be large; keep the convention docs, ignore the payloads.
+provision/*
+!provision/README.md

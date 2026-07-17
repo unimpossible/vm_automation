@@ -4,10 +4,13 @@
 
 ```
 pip install -r requirements.txt              # just paramiko (add pytest to run tests/)
-copy vmconfig.example.json vmconfig.json     # cp on *nix
-# edit vmconfig.json: your VM's host IP, vmx path, snapshot name, user password
-python vm.py vm doctor                       # 5 checks: config, vmrun, vmx, SSH, sudo
+python init.py                               # interactive: pick VMs, writes config + folders
+python vm.py vm doctor                       # checks: config, vmrun, vmx, SSH, sudo
 ```
+
+`init.py` discovers the VMs VMware knows about, auto-detects OS + IP, prompts for the rest, and
+creates `vmconfig.json` plus `staging/` and `provision/`. Prefer to hand-edit? Instead run
+`copy vmconfig.example.json vmconfig.json` (`cp` on *nix) and fill it in.
 
 When all doctor checks say `[PASS]`, you're done — `README.md` is the usage reference.
 `vmconfig.json` holds passwords and is gitignored; never commit it. (Running `vm.py` without a

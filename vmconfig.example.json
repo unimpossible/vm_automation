@@ -14,6 +14,21 @@
       },
       "staging_local": ".\\staging",
       "staging_remote": "/home/user/staging",
+      "tools_remote": "/home/user/tools",
+      "wsl_distro": ""
+    },
+    "mywinvm": {
+      "os": "windows",
+      "host": "192.168.0.101",
+      "vmx": "E:\\Path\\To\\VMs\\mywinvm\\mywinvm.vmx",
+      "snapshot": "clean",
+      "default_user": "IEUser",
+      "users": {
+        "IEUser": {"password": "CHANGE_ME"}
+      },
+      "staging_local": ".\\staging",
+      "staging_remote": "C:/Users/IEUser/staging",
+      "tools_remote": "C:/Users/IEUser/tools",
       "wsl_distro": ""
     }
   }

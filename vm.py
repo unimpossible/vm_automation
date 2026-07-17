@@ -104,9 +104,35 @@ def user_password(vm, user):
     return users[user].get("password", "")
 
 
+def guest_os(vm):
+    """'linux' (default) or 'windows' - selects OS-specific behavior."""
+    return (vm.get("os") or "linux").strip().lower()
+
+
+def tools_remote(vm):
+    """Guest dir where staged tools live and which `run` prepends to PATH.
+
+    Config key `tools_remote` overrides the default (<home>/tools)."""
+    t = vm.get("tools_remote")
+    if t:
+        return t
+    user = vm.get("default_user") or "user"
+    if guest_os(vm) == "windows":
+        return "C:/Users/%s/tools" % user
+    return "/root/tools" if user == "root" else "/home/%s/tools" % user
+
+
+def _wrap_tools_path(vm, cmd):
+    """Prepend the staged tools dir to PATH for a `run` command (OS-aware)."""
+    tools = tools_remote(vm)
+    if guest_os(vm) == "windows":
+        return 'set "PATH=%s;%%PATH%%" & %s' % (tools.replace("/", "\\"), cmd)
+    return 'export PATH=%s:"$PATH"; %s' % (shlex.quote(tools), cmd)
+
+
 # --- SSH ---------------------------------------------------------------------
-def ssh_connect(vm):
-    """Open a paramiko SSHClient to the VM's default_user. Fail fast on a dead VM."""
+def _ssh_open(vm):
+    """Attempt one paramiko connection; return client or raise."""
     host = vm.get("host")
     if not host:
         die("VM has no host/IP configured")
@@ -116,20 +142,39 @@ def ssh_connect(vm):
     password = user_password(vm, user)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=host,
-            username=user,
-            password=password,
-            timeout=CONNECT_TIMEOUT,
-            banner_timeout=CONNECT_TIMEOUT,
-            auth_timeout=CONNECT_TIMEOUT,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-    except Exception as e:
-        die("cannot connect to %s@%s: %s" % (user, host, e), EXIT_ENV)
+    client.connect(
+        hostname=host,
+        username=user,
+        password=password,
+        timeout=CONNECT_TIMEOUT,
+        banner_timeout=CONNECT_TIMEOUT,
+        auth_timeout=CONNECT_TIMEOUT,
+        look_for_keys=False,
+        allow_agent=False,
+    )
     return client
+
+
+def ssh_connect(cfg, vm):
+    """Open a paramiko SSHClient to the VM's default_user. Fail fast on a dead VM.
+
+    On a Windows VM whose SSH isn't up yet, bootstrap OpenSSH once over the
+    VMware Tools channel (no manual in-guest step) and retry.
+    """
+    user = vm.get("default_user")
+    host = vm.get("host")
+    try:
+        return _ssh_open(vm)
+    except Exception as e:
+        if guest_os(vm) == "windows":
+            status("SSH not reachable; enabling OpenSSH in the Windows guest...")
+            if bootstrap_windows_ssh(cfg, vm):
+                try:
+                    return _ssh_open(vm)
+                except Exception as e2:
+                    die("Windows guest bootstrap ran but SSH still refused: %s" % e2,
+                        EXIT_ENV)
+        die("cannot connect to %s@%s: %s" % (user, host, e), EXIT_ENV)
 
 
 def _read_all(chan, timeout):
@@ -200,7 +245,8 @@ def exec_command(client, vm, cmd, as_user=None, timeout=DEFAULT_TIMEOUT, stdin_d
 def cmd_run(client, vm, args):
     try:
         rc, out, err = exec_command(
-            client, vm, args.command, as_user=args.as_user, timeout=args.timeout)
+            client, vm, _wrap_tools_path(vm, args.command),
+            as_user=args.as_user, timeout=args.timeout)
     except TimeoutError as e:
         die(str(e), EXIT_TIMEOUT)
     sys.stdout.buffer.write(out)
@@ -238,17 +284,39 @@ def _push_b64(client, vm, local, remote):
         die("base64 push decode failed: %s" % err.decode(errors="replace"))
 
 
+def _ensure_remote_dir(client, vm, sftp, remote_dir):
+    """Create a remote directory (and parents). OS-aware: `mkdir -p` on Linux,
+    recursive SFTP mkdir on Windows (whose default cmd shell has no `mkdir -p`)."""
+    if not remote_dir:
+        return
+    if guest_os(vm) == "windows":
+        if sftp is None:
+            return
+        parts = remote_dir.replace("\\", "/").split("/")
+        cur = ""
+        for p in parts:
+            if not p:
+                continue
+            cur = p if not cur else cur + "/" + p
+            try:
+                sftp.mkdir(cur)
+            except IOError:
+                pass  # already exists
+    else:
+        exec_command(client, vm, "mkdir -p %s" % shlex.quote(remote_dir), timeout=30)
+
+
 def _push_file(client, vm, local, remote, sftp):
     """Upload one file; SFTP if available, base64-over-exec fallback. Returns method used."""
     if sftp is not None:
         try:
-            parent = posixpath.dirname(remote)
-            if parent:
-                exec_command(client, vm, "mkdir -p %s" % shlex.quote(parent), timeout=30)
+            _ensure_remote_dir(client, vm, sftp, posixpath.dirname(remote))
             sftp.put(local, remote)
             return "sftp"
         except Exception:
             pass
+    if guest_os(vm) == "windows":
+        die("SFTP upload failed and there is no base64 fallback on Windows guests")
     _push_b64(client, vm, local, remote)
     return "base64"
 
@@ -280,7 +348,7 @@ def cmd_push(client, vm, args):
             status("pushed %s -> %s (%s)" % (local, remote, used))
         else:
             # multiple sources -> dest is a remote directory
-            exec_command(client, vm, "mkdir -p %s" % shlex.quote(dest), timeout=30)
+            _ensure_remote_dir(client, vm, sftp, dest)
             for lf in locals_:
                 remote = posixpath.join(dest, os.path.basename(lf))
                 _push_file(client, vm, lf, remote, sftp)
@@ -344,8 +412,8 @@ def cmd_sync(client, vm, args):
         for n in names:
             files.append(os.path.join(root, n))
 
-    exec_command(client, vm, "mkdir -p %s" % shlex.quote(remotedir), timeout=30)
     sftp = _sftp_or_none(client)
+    _ensure_remote_dir(client, vm, sftp, remotedir)
     count = 0
     made = set()
     for lf in files:
@@ -353,7 +421,7 @@ def cmd_sync(client, vm, args):
         rf = posixpath.join(remotedir, rel)
         parent = posixpath.dirname(rf)
         if parent and parent not in made:
-            exec_command(client, vm, "mkdir -p %s" % shlex.quote(parent), timeout=30)
+            _ensure_remote_dir(client, vm, sftp, parent)
             made.add(parent)
         ok = False
         if sftp is not None:
@@ -584,6 +652,86 @@ def vmx_path(vm):
     return p
 
 
+# --- VMware Tools guest operations (no SSH; used to bootstrap Windows SSH) ----
+# PowerShell that idempotently turns on the built-in OpenSSH Server. Runs elevated
+# via vmrun's Tools channel (the guest user must be a local admin). Writes a result
+# marker we copy back so we can tell setup apart from a silent no-op.
+WINDOWS_SSH_SETUP_PS1 = r"""
+$o = @()
+try {
+  $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
+  if ($cap.State -ne 'Installed') {
+    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+    $o += 'capability=installed'
+  } else { $o += 'capability=present' }
+} catch { $o += 'capability_err=' + $_.Exception.Message }
+try {
+  Set-Service -Name sshd -StartupType Automatic
+  Start-Service sshd
+  $o += 'sshd=' + (Get-Service sshd).Status
+} catch { $o += 'sshd_err=' + $_.Exception.Message }
+if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+  New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
+    -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+  $o += 'firewall=created'
+} else { $o += 'firewall=present' }
+$o | Out-File -FilePath 'C:\Windows\Temp\vm_setup_ssh.out' -Encoding ascii
+"""
+
+
+def _vmrun_guest(cfg, vm, op_args, timeout=180):
+    """Run a vmrun guest operation with this VM's guest credentials injected."""
+    user = vm.get("default_user")
+    if not user:
+        die("VM has no default_user for guest operations")
+    pw = user_password(vm, user)
+    args = ["-T", "ws", "-gu", user, "-gp", pw] + op_args
+    return run_vmrun(cfg, args, timeout=timeout)
+
+
+def bootstrap_windows_ssh(cfg, vm):
+    """Enable OpenSSH in a Windows guest over VMware Tools, then wait for SSH.
+
+    Returns True once SSH accepts a connection, False otherwise. Idempotent.
+    """
+    if guest_os(vm) != "windows":
+        return False
+    vmx = vmx_path(vm)
+    # Tools must be up for guest ops to work at all.
+    rc, out, err = run_vmrun(cfg, ["checkToolsState", vmx], timeout=60)
+    state = out.strip()
+    if state != "running":
+        die("VMware Tools not running in guest (state=%s); can't bootstrap SSH" % (state or "?"))
+
+    ps = "C:\\Windows\\Temp\\vm_setup_ssh.ps1"
+    fd, tmp = tempfile.mkstemp(suffix=".ps1")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii", errors="replace") as f:
+            f.write(WINDOWS_SSH_SETUP_PS1)
+        rc, out, err = _vmrun_guest(cfg, vm, ["copyFileFromHostToGuest", vmx, tmp, ps], 120)
+        if rc != 0:
+            die("could not copy setup script into guest: %s" % (err or out).strip())
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    rc, out, err = _vmrun_guest(
+        cfg, vm,
+        ["runProgramInGuest", vmx, powershell,
+         "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", ps],
+        timeout=300)
+    if rc != 0:
+        die("OpenSSH setup script failed in guest: %s" % (err or out).strip())
+
+    host = vm.get("host")
+    if host and _wait_for_ssh(vm, host, timeout=90):
+        return True
+    return False
+
+
 def cmd_vm_snapshot(cfg, vm, args):
     snap = args.snap or vm.get("snapshot")
     if not snap:
@@ -709,9 +857,178 @@ def cmd_vm_reset(cfg, vm, vm_name, args, config_path):
     cfg["vms"][vm_name]["host"] = ip
     atomic_write_json(config_path, cfg)
     status("IP=%s (saved); waiting for SSH..." % ip)
-    if not _wait_for_ssh(vm, ip):
+    if guest_os(vm) == "windows":
+        # A reverted Windows guest may need OpenSSH started again; bootstrap is idempotent.
+        if not _wait_for_ssh(vm, ip, timeout=30) and not bootstrap_windows_ssh(cfg, vm):
+            die("VM up at %s but SSH never came up" % ip, EXIT_ENV)
+    elif not _wait_for_ssh(vm, ip):
         die("VM up at %s but SSH never came up" % ip, EXIT_ENV)
     status("reset complete: %s reachable at %s" % (vm_name, ip))
+    return 0
+
+
+def cmd_vm_setup_ssh(cfg, vm, vm_name, args):
+    """Enable OpenSSH in the guest so the SSH verbs work. Windows-only; idempotent."""
+    if guest_os(vm) != "windows":
+        status("%s is a %s guest; SSH is native - nothing to set up" %
+               (vm_name, guest_os(vm)))
+        return 0
+    if not vm.get("host"):
+        die("VM has no host/IP configured (run: python vm.py --vm %s vm ip --save)" % vm_name)
+    if bootstrap_windows_ssh(cfg, vm):
+        status("OpenSSH is up on %s (%s); SSH verbs are ready" % (vm_name, vm.get("host")))
+        return 0
+    die("bootstrap ran but SSH did not come up on %s" % vm.get("host"), EXIT_ENV)
+
+
+# --- Provisioning: stage a host folder of tools into the guest ---------------
+# Convention over config: drop files in provision/<vm-name>/ (or provision/<os>/)
+# next to vm.py. On first connect they're synced to the guest tools dir and made
+# executable; an optional setup.sh (Linux) / setup.ps1 (Windows, run elevated over
+# VMware Tools) does anything a plain copy can't. A hash marker skips unchanged runs.
+def _here():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def provision_local_dir(vm, vm_name):
+    """Host folder to stage, or None. Prefers provision/<vm-name>/, then provision/<os>/."""
+    base = os.path.join(_here(), "provision")
+    for cand in (vm_name, guest_os(vm)):
+        d = os.path.join(base, cand)
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def _tree_hash(localdir):
+    """Stable hash of a folder's relative paths + contents (order-independent)."""
+    h = hashlib.sha256()
+    for root, dirs, names in os.walk(localdir):
+        dirs.sort()
+        for n in sorted(names):
+            p = os.path.join(root, n)
+            rel = os.path.relpath(p, localdir).replace(os.sep, "/")
+            h.update(rel.encode())
+            with open(p, "rb") as f:
+                h.update(hashlib.sha256(f.read()).digest())
+    return h.hexdigest()
+
+
+def _run_setup_script(cfg, vm, client, tools, localdir):
+    """Run the optional setup script once (Linux: setup.sh over SSH; Windows:
+    setup.ps1 over the elevated VMware Tools channel)."""
+    if guest_os(vm) == "windows":
+        if not os.path.isfile(os.path.join(localdir, "setup.ps1")):
+            return
+        winpath = (posixpath.join(tools, "setup.ps1")).replace("/", "\\")
+        powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+        status("running setup.ps1 (elevated, via VMware Tools)...")
+        rc, out, err = _vmrun_guest(
+            cfg, vm, ["runProgramInGuest", vmx_path(vm), powershell,
+                      "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", winpath],
+            timeout=1800)
+        if rc != 0:
+            die("setup.ps1 failed in guest: %s" % (err or out).strip(), rc or 1)
+    else:
+        if not os.path.isfile(os.path.join(localdir, "setup.sh")):
+            return
+        status("running setup.sh...")
+        rc, out, err = exec_command(
+            client, vm, "bash %s" % shlex.quote(posixpath.join(tools, "setup.sh")),
+            timeout=1800)
+        if err:
+            sys.stderr.buffer.write(err)
+            sys.stderr.buffer.flush()
+        if rc != 0:
+            die("setup.sh failed (rc=%d)" % rc, rc or 1)
+
+
+def provision_guest(cfg, vm, vm_name, client, force=False, verbose=True):
+    """Ensure provision/<vm|os>/ is staged into the guest tools dir. Returns True
+    if it did work, False if nothing to do / already current. Idempotent."""
+    localdir = provision_local_dir(vm, vm_name)
+    if not localdir:
+        return False
+    tools = tools_remote(vm)
+    marker = posixpath.join(tools, ".provisioned")
+    want = _tree_hash(localdir)
+
+    sftp = _sftp_or_none(client)
+    if sftp is None:
+        die("provisioning needs SFTP but it is unavailable")
+    try:
+        have = None
+        try:
+            with sftp.open(marker, "r") as f:
+                have = f.read().decode(errors="replace").strip()
+        except IOError:
+            have = None
+        if have == want and not force:
+            if verbose:
+                status("tools already current (%s)" % os.path.basename(localdir))
+            return False
+
+        _ensure_remote_dir(client, vm, sftp, tools)
+        files = []
+        for root, dirs, names in os.walk(localdir):
+            dirs.sort()
+            for n in sorted(names):
+                files.append(os.path.join(root, n))
+        made = set()
+        for lf in files:
+            rel = os.path.relpath(lf, localdir).replace(os.sep, "/")
+            rf = posixpath.join(tools, rel)
+            parent = posixpath.dirname(rf)
+            if parent and parent not in made:
+                _ensure_remote_dir(client, vm, sftp, parent)
+                made.add(parent)
+            sftp.put(lf, rf)
+        status("staged %d file(s) -> %s" % (len(files), tools))
+
+        if guest_os(vm) != "windows":
+            exec_command(client, vm,
+                         "find %s -type f -exec chmod +x {} +" % shlex.quote(tools),
+                         timeout=60)
+
+        _run_setup_script(cfg, vm, client, tools, localdir)
+
+        with sftp.open(marker, "w") as f:
+            f.write(want)
+        status("provisioned %s from %s" % (vm_name, os.path.basename(localdir)))
+        return True
+    finally:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+
+
+def maybe_auto_provision(cfg, vm, vm_name, client):
+    """Called after a successful connect for guest verbs: stage tools if a
+    provision folder exists and the guest is missing/out of date. A hard error
+    (die) in a setup step propagates; softer failures degrade to a warning."""
+    if provision_local_dir(vm, vm_name) is None:
+        return
+    try:
+        provision_guest(cfg, vm, vm_name, client, force=False, verbose=False)
+    except SystemExit:
+        raise
+    except Exception as e:
+        status("warning: auto-provision skipped: %s" % e)
+
+
+def cmd_vm_provision(cfg, vm, vm_name, args):
+    if provision_local_dir(vm, vm_name) is None:
+        die("no provision folder: create provision/%s/ or provision/%s/ next to vm.py"
+            % (vm_name, guest_os(vm)))
+    client = ssh_connect(cfg, vm)
+    try:
+        changed = provision_guest(cfg, vm, vm_name, client, force=args.force, verbose=True)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
     return 0
 
 
@@ -772,12 +1089,26 @@ def cmd_vm_doctor(cfg, vm, vm_name, args, config_path):
         ssh_detail = "%s@%s" % (user, host)
     except Exception as e:
         ssh_detail = str(e)
+        if guest_os(vm) == "windows":
+            ssh_detail += "  (run: python vm.py --vm %s vm setup-ssh)" % vm_name
     checks.append(("ssh connects", ssh_ok, ssh_detail))
 
-    # per configured user: (a) `--as USER` impersonation works from default_user,
-    # (b) the user's own sudo rights match the config's `sudo` flag
     users = vm.get("users") or {}
-    if ssh_ok:
+    if guest_os(vm) == "windows":
+        # Windows guests have no sudo/`--as`; just confirm SSH command execution works.
+        if ssh_ok:
+            try:
+                rc, out, err = exec_command(client, vm, "whoami", timeout=30)
+                got = out.decode(errors="replace").strip()
+                checks.append(("ssh exec works", rc == 0 and bool(got),
+                               got or "rc=%d" % rc))
+            except Exception as e:
+                checks.append(("ssh exec works", False, str(e)))
+        else:
+            checks.append(("ssh exec works", False, "ssh down"))
+    elif ssh_ok:
+        # per configured user: (a) `--as USER` impersonation works from default_user,
+        # (b) the user's own sudo rights match the config's `sudo` flag
         for uname in sorted(users):
             try:
                 rc, out, err = exec_command(client, vm, "id -un", as_user=uname,
@@ -943,6 +1274,9 @@ def build_parser():
     x = vsub.add_parser("ip", help="discover guest IP")
     x.add_argument("--save", action="store_true", help="write IP back to config (atomic)")
     vsub.add_parser("doctor", help="validate config/vmrun/vmx/SSH/sudo with PASS/FAIL report")
+    vsub.add_parser("setup-ssh", help="(Windows guest) enable OpenSSH over VMware Tools")
+    xp = vsub.add_parser("provision", help="stage provision/<vm|os>/ into the guest tools dir")
+    xp.add_argument("--force", action="store_true", help="re-stage even if unchanged")
 
     # mount / umount (optional WSL)
     sub.add_parser("mount", help="(optional) sshfs live-bind staging dir via WSL")
@@ -995,6 +1329,10 @@ def main(argv=None):
             return cmd_vm_ip(cfg, vm, vm_name, args, config_path)
         if vv == "doctor":
             return cmd_vm_doctor(cfg, vm, vm_name, args, config_path)
+        if vv == "setup-ssh":
+            return cmd_vm_setup_ssh(cfg, vm, vm_name, args)
+        if vv == "provision":
+            return cmd_vm_provision(cfg, vm, vm_name, args)
         die("unknown vm subcommand: %s" % vv)
 
     if verb == "mount":
@@ -1004,7 +1342,8 @@ def main(argv=None):
 
     # Guest-side SSH verbs
     if verb in GUEST_VERBS:
-        client = ssh_connect(vm)
+        client = ssh_connect(cfg, vm)
+        maybe_auto_provision(cfg, vm, vm_name, client)
         try:
             if verb == "run":
                 return cmd_run(client, vm, args)
