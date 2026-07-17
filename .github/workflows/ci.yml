@@ -79,18 +79,5 @@ jobs:
           name: dist
           path: dist
 
-      # STUB: before this job can succeed you must, once, on pypi.org:
-      #   1. Create the project (or reserve the name) "vm-automation-cli".
-      #   2. Add a Trusted Publisher: this repo, workflow "ci.yml",
-      #      environment "pypi" (Manage project -> Publishing).
-      #   3. (Optional) Create a "pypi" environment in the GitHub repo settings
-      #      with required reviewers to gate releases manually.
-      # Then delete the guard step below and tag a release: git tag v0.1.0 && git push --tags
-      - name: Publishing not yet configured
-        run: |
-          echo "::warning::PyPI trusted publishing is not configured yet; skipping upload."
-          echo "See the comments in .github/workflows/ci.yml (publish job) for setup steps."
-
-      # Uncomment once trusted publishing is set up on pypi.org:
-      # - name: Publish to PyPI
-      #   uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
