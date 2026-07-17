@@ -4,6 +4,11 @@ __pycache__/
 .pytest_cache/
 staging/
 
+# Packaging / build artifacts
+*.egg-info/
+build/
+dist/
+
 # Staged tool binaries can be large; keep the convention docs, ignore the payloads.
 provision/*
 !provision/README.md

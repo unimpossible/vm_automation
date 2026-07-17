@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""init.py - interactive setup for vm.py.
+"""vm-init - interactive setup for the `vm` CLI.
 
 Discovers the VMs VMware currently knows about (running ones via `vmrun list`,
 registered ones from the inventory), lets you choose which to add, auto-detects
 each guest's OS and IP, and writes a vmconfig.json plus the staging/ and
-provision/ folder structure. Re-runnable: merges into an existing config.
+provision/ folder structure in the current directory. Optionally appends a
+"Test VM" section to a local AGENTS.md. Re-runnable: merges into an existing config.
 
-Usage:  python init.py [--config PATH] [--dir BASE]
+Usage:  vm-init [--config PATH] [--dir BASE] [--agents]
 """
 
 import argparse
@@ -17,8 +18,6 @@ import subprocess
 import sys
 import tempfile
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
 VMRUN_CANDIDATES = [
     r"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe",
     r"C:\Program Files\VMware\VMware Workstation\vmrun.exe",
@@ -27,8 +26,8 @@ VMRUN_CANDIDATES = [
 PROVISION_README = """\
 # provision/ - tools staged into the guest on first run
 
-Drop files in `provision/<vm-name>/` (or `provision/<os>/`) next to vm.py. On the
-first guest command they sync to the guest tools dir (`tools_remote`, default
+Drop files in `provision/<vm-name>/` (or `provision/<os>/`) in this directory. On
+the first guest command they sync to the guest tools dir (`tools_remote`, default
 `<home>/tools`), are made executable on Linux, and that dir is prepended to `PATH`
 for `run`. No manifest - the folder is the config.
 
@@ -36,7 +35,26 @@ An optional `setup.sh` (Linux) / `setup.ps1` (Windows, run elevated over VMware
 Tools) at the folder root runs once after the copy, for anything a plain copy
 can't do (installers, apt, registry).
 
-Run/refresh with `python vm.py --vm NAME vm provision [--force]`.
+Run/refresh with `vm --vm NAME vm provision [--force]`.
+"""
+
+AGENTS_SECTION = """\
+## Test VM
+
+A local VM is available for running and testing code, driven by the `vm` CLI (on PATH).
+
+- `vm run "<cmd>"` - run a command in the VM; exit code is the command's own
+- `vm push <file>... <dest>` / `vm pull <remote> [local]` - copy files in/out
+- `vm sync <dir>` - bulk-upload a directory
+- `vm build-run <src>` - upload, compile, and run a source file (Linux)
+- `vm vm doctor` - health check; `vm vm reset` - restore the clean snapshot
+
+Config is `vmconfig.json` in this directory (created by `vm-init`). Tools placed in
+`provision/<vm>/` are auto-installed into the guest on first use and added to PATH.
+
+Rules: confine guest writes to an agreed directory; never run
+`vm vm revert/reset/stop/snapshot` unless explicitly asked or the VM is broken.
+If a command fails, run `vm vm doctor` before retrying; don't retry more than twice.
 """
 
 
@@ -378,13 +396,39 @@ def ensure_folders(base, vm_names):
     return made
 
 
+def write_agents(base, interactive, force):
+    """Append the 'Test VM' section to <base>/AGENTS.md. Idempotent (skips if the
+    section is already there). Returns the path if written, else None."""
+    path = os.path.join(base, "AGENTS.md")
+    cur = ""
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cur = f.read()
+        except OSError:
+            cur = ""
+        if "## Test VM" in cur:
+            return None  # already present
+    if not force:
+        if not interactive or not ask_yes("Append a 'Test VM' section to ./AGENTS.md?",
+                                          default=False):
+            return None
+    sep = "" if not cur else ("\n" if cur.endswith("\n") else "\n\n")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(sep + AGENTS_SECTION.strip() + "\n")
+    return path
+
+
 # --- main --------------------------------------------------------------------
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Interactive setup for vm.py")
-    ap.add_argument("--config", default=os.path.join(HERE, "vmconfig.json"),
-                    help="config path to write (default: vmconfig.json next to init.py)")
-    ap.add_argument("--dir", default=HERE,
-                    help="base dir for staging/ and provision/ (default: next to init.py)")
+    ap = argparse.ArgumentParser(prog="vm-init",
+                                 description="Interactive setup for the vm CLI")
+    ap.add_argument("--config", default=os.path.join(os.getcwd(), "vmconfig.json"),
+                    help="config path to write (default: ./vmconfig.json)")
+    ap.add_argument("--dir", default=os.getcwd(),
+                    help="base dir for staging/ and provision/ (default: current directory)")
+    ap.add_argument("--agents", action="store_true",
+                    help="append a 'Test VM' section to ./AGENTS.md without prompting")
     args = ap.parse_args(argv)
 
     vmrun = find_vmrun()
@@ -471,15 +515,28 @@ def main(argv=None):
             return 0
     atomic_write_json(args.config, cfg)
     made = ensure_folders(args.dir, list(cfg["vms"]))
-
     print("\nWrote %s" % args.config)
+
+    agents = write_agents(args.dir, interactive, args.agents)
+
     print("  VMs:       %s" % ", ".join(names))
     print("  default:   %s" % cfg["default_vm"])
     if made:
         print("  created:   %s" % ", ".join(os.path.relpath(m, args.dir) for m in made))
-    print("\nNext: python vm.py vm doctor")
+    if agents:
+        print("  AGENTS.md: appended 'Test VM' section")
+    print("\nNext: vm vm doctor")
     return 0
 
 
+def console_main():
+    """Console-script entry point for the `vm-init` command."""
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\ninterrupted\n")
+        sys.exit(130)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    console_main()

@@ -38,6 +38,11 @@ EXIT_ENV = 125  # can't connect / config error / bad usage
 CONNECT_TIMEOUT = 10   # paramiko TCP/auth timeout (seconds)
 DEFAULT_TIMEOUT = 120  # default remote command timeout (seconds)
 
+# Directory the config lives in; provision/ and other project files anchor here.
+# Set from the resolved config path in main(); defaults to the working directory so
+# the installed `vm` command finds vmconfig.json / provision/ in the user's project.
+PROJECT_DIR = os.getcwd()
+
 
 def die(msg, code=EXIT_ENV):
     """Print one clear error line to stderr and exit with the given code."""
@@ -56,12 +61,9 @@ def load_config(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        msg = "config file not found: %s" % path
-        here = os.path.dirname(os.path.abspath(__file__))
-        if os.path.exists(os.path.join(here, "vmconfig.example.json")):
-            msg += ("\nfirst-time setup: copy vmconfig.example.json to vmconfig.json, "
-                    "fill in host/vmx/password, then run: python vm.py vm doctor")
-        die(msg)
+        die("config file not found: %s\n"
+            "first-time setup: run `vm-init` here to create vmconfig.json, "
+            "then run: vm vm doctor" % path)
     except json.JSONDecodeError as e:
         die("config file is not valid JSON: %s" % e)
 
@@ -886,13 +888,10 @@ def cmd_vm_setup_ssh(cfg, vm, vm_name, args):
 # next to vm.py. On first connect they're synced to the guest tools dir and made
 # executable; an optional setup.sh (Linux) / setup.ps1 (Windows, run elevated over
 # VMware Tools) does anything a plain copy can't. A hash marker skips unchanged runs.
-def _here():
-    return os.path.dirname(os.path.abspath(__file__))
-
-
 def provision_local_dir(vm, vm_name):
-    """Host folder to stage, or None. Prefers provision/<vm-name>/, then provision/<os>/."""
-    base = os.path.join(_here(), "provision")
+    """Host folder to stage, or None. Prefers provision/<vm-name>/, then provision/<os>/.
+    Anchored to PROJECT_DIR (the config's directory), so it works when installed."""
+    base = os.path.join(PROJECT_DIR, "provision")
     for cand in (vm_name, guest_os(vm)):
         d = os.path.join(base, cand)
         if os.path.isdir(d):
@@ -1203,7 +1202,7 @@ def cmd_umount(cfg, vm, args):
 # --- Argument parsing --------------------------------------------------------
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="vm.py",
+        prog="vm",
         description="Generic VM automation: guest control over SSH + host control via vmrun.")
     p.add_argument("--vm", help="named VM from config (default: config default_vm)")
     p.add_argument("--config", help="config path (default: vmconfig.json next to vm.py, "
@@ -1291,7 +1290,8 @@ def resolve_config_path(args):
     env = os.environ.get("VM_CONFIG")
     if env:
         return env
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "vmconfig.json")
+    # Default to vmconfig.json in the working directory (the user's project).
+    return os.path.join(os.getcwd(), "vmconfig.json")
 
 
 # Verbs that need an SSH client vs those that are host-only.
@@ -1299,10 +1299,12 @@ GUEST_VERBS = {"run", "push", "pull", "sync", "build-run", "snap", "verify", "wa
 
 
 def main(argv=None):
+    global PROJECT_DIR
     parser = build_parser()
     args = parser.parse_args(argv)
 
     config_path = resolve_config_path(args)
+    PROJECT_DIR = os.path.dirname(os.path.abspath(config_path))
     cfg = load_config(config_path)
     vm_name, vm = resolve_vm(cfg, args.vm)
 
@@ -1370,9 +1372,14 @@ def main(argv=None):
     die("unknown verb: %s" % verb)
 
 
-if __name__ == "__main__":
+def console_main():
+    """Console-script entry point for the `vm` command."""
     try:
         sys.exit(main())
     except KeyboardInterrupt:
         sys.stderr.write("interrupted\n")
         sys.exit(130)
+
+
+if __name__ == "__main__":
+    console_main()

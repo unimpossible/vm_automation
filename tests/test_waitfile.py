@@ -4,7 +4,7 @@ import subprocess
 import sys
 import time
 
-from conftest import VM_PY, DEFAULT_CONFIG, VM_NAME
+from conftest import VM_MODULE, DEFAULT_CONFIG, VM_NAME, _REPO_ROOT
 
 
 def test_waitfile_returns_0_when_file_appears(run_vm, run_dir):
@@ -13,9 +13,9 @@ def test_waitfile_returns_0_when_file_appears(run_vm, run_dir):
 
     # Launch a detached `run` that sleeps then touches the file (non-blocking on the host).
     toucher = subprocess.Popen(
-        [sys.executable, VM_PY, "--config", DEFAULT_CONFIG, "--vm", VM_NAME,
+        [sys.executable, "-m", VM_MODULE, "--config", DEFAULT_CONFIG, "--vm", VM_NAME,
          "run", "sleep 3; touch %s" % path],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=_REPO_ROOT,
     )
     try:
         rc, out, err = run_vm(["waitfile", path, "--timeout", "25"], timeout=40)

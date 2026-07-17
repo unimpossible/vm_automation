@@ -21,7 +21,8 @@ import pytest
 
 # Tool under test and its real config live in the repo root (this file's parent).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VM_PY = os.path.join(_REPO_ROOT, "vm.py")
+# Invoke the CLI as a module so it exercises the installed-style entry path.
+VM_MODULE = "vm_cli.cli"
 DEFAULT_CONFIG = os.path.join(_REPO_ROOT, "vmconfig.json")
 VM_NAME = "ubuntu24"
 EXPECTED_HOST = "192.168.187.130"
@@ -38,8 +39,8 @@ def _run_vm(args, config=None, timeout=60):
     and --vm options must precede the verb (they live on the top-level parser).
     """
     cfg = config or DEFAULT_CONFIG
-    cmd = [sys.executable, VM_PY, "--config", cfg, "--vm", VM_NAME] + list(args)
-    p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    cmd = [sys.executable, "-m", VM_MODULE, "--config", cfg, "--vm", VM_NAME] + list(args)
+    p = subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=_REPO_ROOT)
     out = p.stdout.decode("utf-8", "replace")
     err = p.stderr.decode("utf-8", "replace")
     return p.returncode, out, err

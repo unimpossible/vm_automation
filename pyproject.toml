@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vm-automation-cli"
+version = "0.1.0"
+description = "Drive test VMs from a Windows host: guest control over SSH + host control via vmrun."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["paramiko"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+vm = "vm_cli.cli:console_main"
+vm-init = "vm_cli.init:console_main"
+vm_init = "vm_cli.init:console_main"
+
+[tool.setuptools]
+packages = ["vm_cli"]

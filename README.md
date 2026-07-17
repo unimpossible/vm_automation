@@ -1,23 +1,27 @@
-# vm.py — cheat sheet
+# vm — cheat sheet
 
 CLI to drive test VMs: guest control over SSH (paramiko) + host control over VMware (`vmrun`), primarily to be used by AI agents. 
 
-One entrypoint: `python vm.py [--vm NAME] <verb> ...`. Success = one status line; errors go to stderr
-with a real message + propagated exit code.
+One entrypoint: `vm [--vm NAME] <verb> ...`. Success = one status line; errors go to stderr
+with a real message + propagated exit code. (Package `vm-automation-cli`, import `vm_cli`.)
 
 ## Setup
 ```
-pip install -r requirements.txt             # just paramiko
-python init.py                              # pick your VMs; writes config + folders
-python vm.py vm doctor                      # all checks should PASS
+pip install .                               # installs the `vm` and `vm-init` commands
+vm-init                                     # pick your VMs; writes config + folders
+vm vm doctor                                # all checks should PASS
 ```
-`init.py` is interactive: it finds the VMs VMware knows about (running + registered), auto-detects
+`vm-init` is interactive: it finds the VMs VMware knows about (running + registered), auto-detects
 each guest's OS and IP, prompts for user/password/snapshot, and writes `vmconfig.json` plus the
-`staging/` and `provision/` folders. Re-run it any time to add more VMs (it merges). To fill in a
+`staging/` and `provision/` folders in the current directory. Re-run it any time to add more VMs
+(it merges); pass `--agents` to also drop a "Test VM" section into `./AGENTS.md`. To fill in a
 config by hand instead, `copy vmconfig.example.json vmconfig.json` and edit.
 
-`vmconfig.json` is gitignored (holds passwords). `default_vm` in config is used when `--vm` is
-omitted. To wire the tool into Claude Code or another coding agent, see `INSTALL.md`.
+Config lookup: `--config PATH`, else `$VM_CONFIG`, else `vmconfig.json` in the working directory —
+so `vm` finds the config (and `provision/`) in whatever project you run it from. `vmconfig.json` is
+gitignored (holds passwords). `default_vm` is used when `--vm` is omitted. Running from source
+without installing? Use `python -m vm_cli.cli <verb>` and `python -m vm_cli.init`. To wire the tool
+into Claude Code or another coding agent, see `INSTALL.md`.
 
 ## Verbs
 
@@ -44,7 +48,6 @@ omitted. To wire the tool into Claude Code or another coding agent, see `INSTALL
 | `vm snapshots` | | list snapshots |
 | `vm ip` | `[--save]` | discover guest IP, optionally write to config |
 | `vm doctor` | | health check: config, vmrun, vmx, SSH; per user: `--as` works + sudo rights match config's `sudo` flag |
-
 | `vm setup-ssh` | | (Windows guest) enable OpenSSH Server over VMware Tools; idempotent |
 | `vm provision` | `[--force]` | stage `provision/<vm\|os>/` into the guest tools dir; run its setup script |
 
@@ -52,8 +55,8 @@ omitted. To wire the tool into Claude Code or another coding agent, see `INSTALL
 
 ## Provisioning (staging tools into the guest)
 
-Drop files into `provision/<vm-name>/` (or `provision/<os>/`) next to `vm.py`. On the first
-guest command they're synced to the guest tools dir (`tools_remote`, default `<home>/tools`),
+Drop files into `provision/<vm-name>/` (or `provision/<os>/`) in your project directory (beside
+`vmconfig.json`). On the first guest command they're synced to the guest tools dir (`tools_remote`, default `<home>/tools`),
 made executable on Linux, and that dir is prepended to `PATH` for `run` — so
 `provision/ubuntu24/strace` makes `run "strace -V"` work. No manifest; the folder is the config.
 
@@ -68,7 +71,7 @@ made executable on Linux, and that dir is prepended to `PATH` for `run` — so
 ## Windows guests
 
 Set `"os": "windows"` on the VM block (see `mywinvm` in `vmconfig.example.json`). Windows has no
-SSH by default, so the first guest command needs OpenSSH turned on inside the VM. vm.py does this
+SSH by default, so the first guest command needs OpenSSH turned on inside the VM. `vm` does this
 for you over VMware Tools — no manual step:
 
 - It happens **automatically** the first time an SSH verb can't connect (you'll see
@@ -87,7 +90,7 @@ for you over VMware Tools — no manual step:
 ## If a command fails, do this
 | symptom | action |
 |---|---|
-| exit `125` (can't connect) | `python vm.py vm ip --save` then retry once; still failing → `python vm.py vm doctor` |
+| exit `125` (can't connect) | `vm vm ip --save` then retry once; still failing → `vm vm doctor` |
 | exit `124` (timeout) | retry with a bigger `--timeout N`; if it repeats, the command is hanging — report it |
 | nonzero rc from `run`/`build-run` | that is the remote command's own exit code — read the printed stderr |
 | `vm doctor` shows a `[FAIL]` | fix that one line (config value, vmrun path, credentials); don't retry other verbs first |
@@ -97,7 +100,7 @@ Do not retry the same failing command more than twice.
 
 ## No verb needed for a permission/read check
 ```
-python vm.py run "head -c 64 <path>" --as USER
+vm run "head -c 64 <path>" --as USER
 ```
 
 ## snap/verify are stateless
@@ -108,8 +111,8 @@ python vm.py run "head -c 64 <path>" --as USER
 `push` is cp-style. One source uses a default remote; `SRC DEST` sets a literal remote path;
 `SRC... DESTDIR` pushes many files into a remote directory (shell globs work):
 ```
-python vm.py push ./a.txt /home/user/a.txt          # single, explicit path
-python vm.py push ./a.c ./b.c ./data /home/user/in/  # many files -> a remote dir
+vm push ./a.txt /home/user/a.txt          # single, explicit path
+vm push ./a.c ./b.c ./data /home/user/in/  # many files -> a remote dir
 ```
 For a whole tree, use `sync <localdir> [remotedir]` (recursive, defaults from config staging).
 
@@ -121,18 +124,18 @@ the binary is named after the source stem (`widget.c` → `widget`).
 
 ## Git Bash / MSYS path gotcha
 On Git Bash/MSYS, an absolute POSIX **remote** path in `push`/`pull` (e.g. `/home/user/x`) gets
-silently rewritten to a Windows path before `vm.py` sees it — the upload then "succeeds" at the wrong
+silently rewritten to a Windows path before `vm` sees it — the upload then "succeeds" at the wrong
 place. Prefix the command with `MSYS_NO_PATHCONV=1`, or just run from PowerShell (unaffected):
 ```
-MSYS_NO_PATHCONV=1 python vm.py push ./x /home/user/x
+MSYS_NO_PATHCONV=1 vm push ./x /home/user/x
 ```
 
 ## Examples
 ```
-python vm.py run "id" --as admin
-python vm.py build-run ./test.c --args "1 2 3"
-python vm.py build-run ./test.c --dir /home/user/build   # leaves source + binary there
-python vm.py push ./out.bin /tmp/out.bin && python vm.py run "wc -c /tmp/out.bin"
-python vm.py push ./a.c ./b.c /home/user/src/            # multiple files in one call
-python vm.py vm reset
+vm run "id" --as admin
+vm build-run ./test.c --args "1 2 3"
+vm build-run ./test.c --dir /home/user/build   # leaves source + binary there
+vm push ./out.bin /tmp/out.bin && vm run "wc -c /tmp/out.bin"
+vm push ./a.c ./b.c /home/user/src/            # multiple files in one call
+vm vm reset
 ```
