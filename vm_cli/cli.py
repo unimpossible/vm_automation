@@ -1168,10 +1168,44 @@ def cmd_vm_doctor(cfg, vm, vm_name, args, config_path):
 
 
 # --- Optional WSL mount ------------------------------------------------------
+def default_wsl_distro():
+    """Return the name of the default WSL distro, or None if none is set.
+
+    Parses `wsl -l -v` (UTF-16 encoded on Windows); the default distro is the
+    row flagged with a leading `*`."""
+    try:
+        p = subprocess.run(["wsl", "-l", "-v"],
+                           capture_output=True, timeout=15)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    # wsl.exe emits UTF-16LE; decode leniently and strip NULs either way.
+    try:
+        out = p.stdout.decode("utf-16-le")
+    except (UnicodeDecodeError, LookupError):
+        out = p.stdout.decode("utf-8", "ignore")
+    out = out.replace("\x00", "")
+    for line in out.splitlines():
+        line = line.rstrip()
+        if line.lstrip().startswith("*"):
+            # e.g. "* Ubuntu-24.04    Running    2"
+            parts = line.lstrip("* ").split()
+            if parts:
+                return parts[0]
+    return None
+
+
+def wsl_mount_point(vm):
+    """Per-host mount point under the WSL user's home (writable, unlike /mnt)."""
+    return "$HOME/vmstaging_%s" % vm.get("host", "vm").replace(".", "_")
+
+
 def cmd_mount(cfg, vm, args):
-    distro = vm.get("wsl_distro")
+    distro = vm.get("wsl_distro") or default_wsl_distro()
     if not distro:
-        die("no wsl_distro configured for this VM")
+        die("no wsl_distro configured and no default WSL distro found "
+            "(is WSL installed? `wsl -l -v`)")
     host = vm.get("host")
     user = vm.get("default_user")
     password = user_password(vm, user)
@@ -1179,12 +1213,29 @@ def cmd_mount(cfg, vm, args):
     local = vm.get("staging_local")
     if not remote or not local:
         die("staging_remote and staging_local must be set for mount")
-    mnt = "/mnt/vmstaging_%s" % vm.get("host", "vm").replace(".", "_")
+    # sshfs cannot create the remote directory; if staging_remote doesn't exist
+    # yet (e.g. before the first push/sync) the mount fails with a confusing
+    # "No such file or directory". Ensure it exists first.
+    client = ssh_connect(cfg, vm)
+    try:
+        sftp = None
+        try:
+            sftp = client.open_sftp()
+        except Exception:
+            sftp = None
+        _ensure_remote_dir(client, vm, sftp, remote)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+    mnt = wsl_mount_point(vm)
+    # $HOME is left unquoted so bash expands it; the rest is quoted.
     sshfs = ("mkdir -p %s && echo %s | sshfs -o password_stdin,"
              "StrictHostKeyChecking=no,reconnect %s@%s:%s %s" % (
-                 shlex.quote(mnt), shlex.quote(password),
+                 mnt, shlex.quote(password),
                  shlex.quote(user), shlex.quote(host),
-                 shlex.quote(remote), shlex.quote(mnt)))
+                 shlex.quote(remote), mnt))
     try:
         p = subprocess.run(["wsl", "-d", distro, "bash", "-c", sshfs],
                            capture_output=True, text=True, timeout=60)
@@ -1197,13 +1248,14 @@ def cmd_mount(cfg, vm, args):
 
 
 def cmd_umount(cfg, vm, args):
-    distro = vm.get("wsl_distro")
+    distro = vm.get("wsl_distro") or default_wsl_distro()
     if not distro:
-        die("no wsl_distro configured for this VM")
-    mnt = "/mnt/vmstaging_%s" % vm.get("host", "vm").replace(".", "_")
+        die("no wsl_distro configured and no default WSL distro found "
+            "(is WSL installed? `wsl -l -v`)")
+    mnt = wsl_mount_point(vm)
     try:
         p = subprocess.run(["wsl", "-d", distro, "bash", "-c",
-                            "fusermount -u %s" % shlex.quote(mnt)],
+                            "fusermount -u %s" % mnt],
                            capture_output=True, text=True, timeout=60)
     except Exception as e:
         die("wsl umount failed: %s" % e)

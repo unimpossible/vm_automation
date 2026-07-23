@@ -305,6 +305,28 @@ def get_ip(vmrun, vmx, timeout=25):
 
 
 # --- config assembly ---------------------------------------------------------
+def detect_default_wsl_distro():
+    """Name of the default WSL distro, or None. Parses `wsl -l -v` (UTF-16)."""
+    try:
+        p = subprocess.run(["wsl", "-l", "-v"],
+                           capture_output=True, timeout=15)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        out = p.stdout.decode("utf-16-le")
+    except (UnicodeDecodeError, LookupError):
+        out = p.stdout.decode("utf-8", "ignore")
+    out = out.replace("\x00", "")
+    for line in out.splitlines():
+        if line.lstrip().startswith("*"):
+            parts = line.lstrip("* ").split()
+            if parts:
+                return parts[0]
+    return None
+
+
 def default_name(vmx, meta):
     return meta.get("displayname") or os.path.splitext(os.path.basename(vmx))[0]
 
@@ -354,7 +376,7 @@ def collect_vm(vmrun, vmx, meta, running):
         "staging_local": ".\\staging",
         "staging_remote": d["staging_remote"],
         "tools_remote": d["tools_remote"],
-        "wsl_distro": "",
+        "wsl_distro": detect_default_wsl_distro() or "",
     }
     return name, block
 

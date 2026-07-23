@@ -51,7 +51,19 @@ into Claude Code or another coding agent, see `INSTALL.md`.
 | `vm setup-ssh` | | (Windows guest) enable OpenSSH Server over VMware Tools; idempotent |
 | `vm provision` | `[--force]` | stage `provision/<vm\|os>/` into the guest tools dir; run its setup script |
 
-**Optional (WSL):** `mount` / `umount` — sshfs live-bind VM staging dir via named WSL distro.
+**Optional (WSL):** `mount` / `umount` — sshfs live-bind the VM's `staging_remote` into WSL at
+`$HOME/vmstaging_<host>` (under your WSL home, not `/mnt`, so no root/permissions needed).
+`mount` first ensures `staging_remote` exists on the guest (sshfs can't create it), so it works
+even before your first `push`/`sync`. Uses the VM's `wsl_distro` if set; otherwise falls back to
+your **default** WSL distro (`vm-init` also auto-fills `wsl_distro` with it). Requires `sshfs` in
+the distro (`sudo apt install sshfs`).
+
+> **Note — accessing the mount from Windows.** The mount lives inside WSL. It can't be bound to your
+> Windows-side `staging\` folder: WSL's FUSE refuses to mount over the `/mnt/<drive>` DrvFs bridge.
+> Browsing it from Windows via `\\wsl$\<distro>\home\<user>\vmstaging_<host>` also doesn't work — the
+> folder shows up but opening it returns *Access denied*, because the `\\wsl$` 9p bridge can't traverse
+> a user-owned FUSE mount (a Windows symlink or `.lnk` shortcut inherits the same denial). Use the
+> mount from **inside WSL**; for a Windows-native drive-letter mount, use `sshfs-win`/WinFsp instead.
 
 ## Provisioning (staging tools into the guest)
 
