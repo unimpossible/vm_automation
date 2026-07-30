@@ -340,7 +340,10 @@ def _rel_component(path):
     layout (or escape) into the destination root."""
     norm = path.replace("\\", "/").rstrip("/")
     parts = [p for p in norm.split("/") if p not in ("", ".")]
-    if norm.startswith("/") or os.path.splitdrive(path)[0] or ".." in parts:
+    # Detect a Windows drive (C:/...) explicitly: os.path.splitdrive only sees it
+    # on Windows, but a drive-qualified path must flatten on any host.
+    drive_like = len(norm) >= 2 and norm[1] == ":" and norm[0].isalpha()
+    if norm.startswith("/") or drive_like or os.path.splitdrive(path)[0] or ".." in parts:
         return parts[-1] if parts else os.path.basename(path)
     return "/".join(parts) if parts else os.path.basename(path)
 
