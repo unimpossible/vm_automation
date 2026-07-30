@@ -29,7 +29,7 @@ into Claude Code or another coding agent, see `INSTALL.md`.
 | verb | args | purpose |
 |---|---|---|
 | `run` | `"<cmd>" [--as USER] [--timeout N]` | exec cmd, print stdout/stderr, exit=remote rc |
-| `push` | `<src>... [dest]` | upload, cp-style (SFTP, auto base64 fallback) |
+| `push` | `<src>... [dest]` | upload files/dirs/globs, keeping relative paths (SFTP, auto base64 fallback) |
 | `pull` | `<remote> [local]` | download (SFTP, auto base64 fallback) |
 | `sync` | `<localdir> [remotedir]` | bulk push a staging dir |
 | `build-run` | `<local-src> [--as USER] [--dir REMOTE] [--keep] [--args ...]` | push+compile(gcc)+run source, one call |
@@ -119,14 +119,24 @@ vm run "head -c 64 <path>" --as USER
 `snap` prints a baseline line only — nothing stored on disk. Pass it back via
 `verify <path> --baseline "<line>"`. Safe for concurrent agents (no shared state file).
 
-## Transferring multiple files
-`push` is cp-style. One source uses a default remote; `SRC DEST` sets a literal remote path;
-`SRC... DESTDIR` pushes many files into a remote directory (shell globs work):
+## Transferring files (`push`)
+`push` takes files, directories, and globs. **Globs and directories are expanded by the tool
+itself**, so `push docs/*.txt` works the same whether or not your shell expands it (PowerShell/cmd
+don't). Each source keeps its **relative path under the destination** (default: `staging_remote`),
+so a `docs/` prefix is recreated on the guest:
 ```
-vm push ./a.txt /home/user/a.txt          # single, explicit path
-vm push ./a.c ./b.c ./data /home/user/in/  # many files -> a remote dir
+vm push report.txt                 # -> <staging>/report.txt
+vm push docs/*.txt                 # -> <staging>/docs/*.txt   (docs/ created; .txt only)
+vm push src/**/*.py                # recursive glob
+vm push docs                       # -> <staging>/docs/...     (whole dir, recursive)
+vm push a.txt b.txt /home/user/in  # 2+ args: trailing non-local arg is an explicit remote dir
+vm push local.txt /home/user/x.txt # single file + explicit path = literal rename
 ```
-For a whole tree, use `sync <localdir> [remotedir]` (recursive, defaults from config staging).
+Rules: absolute / drive-qualified / `..` paths fall back to just their basename (a host layout
+isn't leaked into the destination). With 2+ args, a trailing path that doesn't exist locally (no
+file, dir, or glob match) is treated as the remote destination. A non-matching glob or missing file
+is an error (exit 125). `sync <localdir> [remotedir]` remains the shorthand for mirroring a whole
+staging tree using the config defaults.
 
 ## build-run working dir
 By default `build-run` builds in a fresh `/tmp/vmbuild.XXXXXX` dir (unique per run so concurrent

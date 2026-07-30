@@ -15,6 +15,7 @@ Exit codes:  remote rc passes through for `run`/`build-run`;
 
 import argparse
 import base64
+import glob
 import hashlib
 import json
 import os
@@ -323,38 +324,110 @@ def _push_file(client, vm, local, remote, sftp):
     return "base64"
 
 
-def cmd_push(client, vm, args):
-    # cp-style: `push SRC... DEST`. One positional = single file with a default remote;
-    # two positionals = SRC DEST (a literal remote path); 3+ = SRC... DESTDIR (a directory).
-    paths = args.paths
-    if len(paths) == 1:
-        locals_, dest, multi = paths, None, False
-    else:
-        locals_, dest, multi = paths[:-1], paths[-1], len(paths) > 2
+_GLOB_MAGIC = set("*?[")
 
-    for lf in locals_:
-        if not os.path.isfile(lf):
-            die("local file not found: %s" % lf)
+
+def _has_glob(s):
+    return any(c in s for c in _GLOB_MAGIC)
+
+
+def _rel_component(path):
+    """Remote-relative path to preserve for a local source typed on the CLI.
+
+    Keeps a clean relative path so `docs/a.txt` -> `docs/a.txt` (the `docs/`
+    folder is recreated remotely). Falls back to the basename for absolute,
+    drive-qualified, or `..`-containing paths, which must not leak a host-local
+    layout (or escape) into the destination root."""
+    norm = path.replace("\\", "/").rstrip("/")
+    parts = [p for p in norm.split("/") if p not in ("", ".")]
+    if norm.startswith("/") or os.path.splitdrive(path)[0] or ".." in parts:
+        return parts[-1] if parts else os.path.basename(path)
+    return "/".join(parts) if parts else os.path.basename(path)
+
+
+def _expand_sources(paths):
+    """Resolve CLI source args (files, dirs, globs) to (local_file, rel_component)
+    pairs. rel_component is the path under the destination root, preserving the
+    typed structure. A directory yields one pair per contained file (plus a
+    (None, dir) marker if empty, so the remote dir is still created). Globs are
+    expanded here because Windows shells don't expand them for the CLI."""
+    pairs = []
+    for arg in paths:
+        if _has_glob(arg):
+            matches = sorted(glob.glob(arg, recursive=True))
+            if not matches:
+                die("no files match: %s" % arg)
+        else:
+            matches = [arg]
+        for m in matches:
+            if os.path.isdir(m):
+                top = _rel_component(m)
+                found = False
+                for root, _dirs, names in os.walk(m):
+                    for n in sorted(names):
+                        lf = os.path.join(root, n)
+                        rel = os.path.relpath(lf, m).replace(os.sep, "/")
+                        pairs.append((lf, posixpath.join(top, rel)))
+                        found = True
+                if not found:
+                    pairs.append((None, top))
+            elif os.path.isfile(m):
+                pairs.append((m, _rel_component(m)))
+            else:
+                die("local path not found: %s" % m)
+    return pairs
+
+
+def cmd_push(client, vm, args):
+    """Upload files, directories, and globs, preserving each source's relative
+    path under the destination (default: staging_remote).
+
+      push report.txt              -> <staging>/report.txt
+      push docs/*.txt              -> <staging>/docs/<each>.txt   (docs/ created)
+      push docs                    -> <staging>/docs/...          (recursive)
+      push a.txt b.txt REMOTEDIR   -> REMOTEDIR/a.txt, REMOTEDIR/b.txt
+      push local.txt /remote/x.txt -> single-file rename to a literal remote path
+    """
+    paths = args.paths
+    # Destination detection: with 2+ args, a trailing arg that exists neither as
+    # a local file/dir nor as a glob match is an explicit remote destination.
+    dest, sources = None, paths
+    if len(paths) >= 2:
+        last = paths[-1]
+        local_hit = os.path.exists(last) or (
+            _has_glob(last) and glob.glob(last, recursive=True))
+        if not local_hit:
+            dest, sources = last, paths[:-1]
+
+    pairs = _expand_sources(sources)
+    if not pairs:
+        die("nothing to push")
 
     sftp = _sftp_or_none(client)
     try:
-        if not multi:
-            local = locals_[0]
-            remote = dest
-            if not remote:
-                # default: staging_remote/<basename>, else /tmp/<basename>
-                staging = vm.get("staging_remote")
-                base = os.path.basename(local)
-                remote = posixpath.join(staging, base) if staging else "/tmp/" + base
+        # Single file + explicit dest = literal remote path (cp-style rename).
+        if dest is not None and len(pairs) == 1 and pairs[0][0] is not None:
+            local, remote = pairs[0][0], dest
             used = _push_file(client, vm, local, remote, sftp)
             status("pushed %s -> %s (%s)" % (local, remote, used))
+            return 0
+
+        root = dest or vm.get("staging_remote") or "/tmp"
+        made, count, last_remote = set(), 0, None
+        for local, comp in pairs:
+            remote = posixpath.join(root, comp)
+            parent = posixpath.dirname(remote) if local is not None else remote
+            if parent and parent not in made:
+                _ensure_remote_dir(client, vm, sftp, parent)
+                made.add(parent)
+            if local is None:
+                continue  # empty directory: just created above
+            _push_file(client, vm, local, remote, sftp)
+            count, last_remote = count + 1, remote
+        if count == 1:
+            status("pushed %s -> %s" % (pairs[0][0], last_remote))
         else:
-            # multiple sources -> dest is a remote directory
-            _ensure_remote_dir(client, vm, sftp, dest)
-            for lf in locals_:
-                remote = posixpath.join(dest, os.path.basename(lf))
-                _push_file(client, vm, lf, remote, sftp)
-            status("pushed %d file(s) -> %s" % (len(locals_), dest))
+            status("pushed %d file(s) -> %s" % (count, root))
     finally:
         if sftp is not None:
             try:
@@ -1282,10 +1355,13 @@ def build_parser():
     s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="command timeout (s)")
 
     # push
-    s = sub.add_parser("push", help="upload file(s) (SFTP, base64 fallback)")
+    s = sub.add_parser("push", help="upload files/dirs/globs (SFTP, base64 fallback)")
     s.add_argument("paths", nargs="+", metavar="SRC... [DEST]",
-                   help="cp-style: one file uses a default remote; SRC DEST sets a remote path; "
-                        "SRC... DESTDIR pushes many files into a remote directory")
+                   help="SRC may be a file, directory (recursed), or glob (docs/*.txt, "
+                        "src/**/*.py). Sources keep their relative path under the destination "
+                        "(default: staging_remote), so `push docs/*.txt` recreates docs/ remotely. "
+                        "With 2+ args a trailing path that isn't local is an explicit remote DEST; "
+                        "a single file + DEST is a literal rename.")
 
     # pull
     s = sub.add_parser("pull", help="download a file (SFTP, base64 fallback)")
