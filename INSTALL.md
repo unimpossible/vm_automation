@@ -11,25 +11,22 @@ vm vm doctor                                 # checks: config, vmrun, vmx, SSH, 
 ```
 
 `vm-init` discovers the VMs VMware knows about, auto-detects OS + IP, prompts for the rest, and
-creates `vmconfig.json` plus `staging/` and `provision/` in the current directory. Pass `--agents`
-to also append a "Test VM" section to `./AGENTS.md`. Prefer to hand-edit the config? Instead run
-`copy vmconfig.example.json vmconfig.json` (`cp` on *nix) and fill it in. Not installing? Run from
-source with `python -m vm_cli.cli` / `python -m vm_cli.init`.
-
-`vm` looks for `vmconfig.json` in the working directory (or `$VM_CONFIG`, or `--config PATH`), so run
-it from your project dir. When all doctor checks say `[PASS]`, you're done — `README.md` is the usage
-reference. `vmconfig.json` holds passwords and is gitignored; never commit it.
+creates `vmconfig.json` plus `staging/` and `provision/` in the current directory (`--agents` also
+appends a "Test VM" section to `./AGENTS.md`). `vm` looks for that config in the working directory
+— or `$VM_CONFIG`, or `--config PATH` — so run it from your project dir. It holds passwords and is
+gitignored; never commit it. When every doctor check says `[PASS]` you're done: `vm docs` prints
+the usage reference, from any directory, with no repo checked out.
 
 ## Wiring it into Claude Code
 
 Three optional steps, each independent:
 
-**1. Tell the agent the tool exists** — the quickest way is `vm-init --agents`, which drops a
-"Test VM" section into your project's `AGENTS.md`. Or add it to `CLAUDE.md` by hand:
+**1. Tell the agent the tool exists** — quickest is `vm-init --agents`, which drops a "Test VM"
+section into your project's `AGENTS.md`. Or add it to `CLAUDE.md` by hand:
 ```md
 ## Test VM
 Drive the test VM with the `vm` CLI (on PATH), run from this project dir.
-Read its README.md once for the verbs. Rules: confine guest writes to an agreed dir;
+Run `vm docs` once to read the verbs. Rules: confine guest writes to an agreed dir;
 never run `vm vm revert/reset/stop/snapshot` unless explicitly asked or your team wrecked the state.
 ```
 
@@ -44,26 +41,20 @@ never run `vm vm revert/reset/stop/snapshot` unless explicitly asked or your tea
 To keep destructive host verbs behind a prompt, allowlist only safe ones instead
 (`Bash(vm run:*)`, `Bash(vm push:*)`, `pull:*`, `build-run:*`, `Bash(vm vm doctor)`, `vm vm ip:*`).
 
-**3. Install the recovery skill** — makes `/vm-recovery` available (snapshot → reset → sync loop):
+**3. Install the recovery skill** — makes `/vm-recovery` available (snapshot → reset → sync loop).
+It ships inside the package, so no repo checkout is needed:
 ```
-# PowerShell / cmd:
-mkdir .claude\skills\vm-recovery
-copy SKILL.md .claude\skills\vm-recovery\SKILL.md
-
-# bash:
-mkdir -p .claude/skills/vm-recovery && cp SKILL.md .claude/skills/vm-recovery/SKILL.md
+vm docs --install-skill              # -> ./.claude/skills/vm-recovery/SKILL.md
+vm docs --install-skill ~            # global install instead
 ```
-Use `~/.claude/skills/...` instead for a global install.
 
-## Other agents (Cursor, Aider, custom)
-
-It's just a CLI — same three ideas: point the agent at `README.md`, allow `vm ...` in the harness's
-command allowlist, and state the guardrails below in the system prompt.
+For other agents (Cursor, Aider, custom) it's the same three ideas: tell the agent to run
+`vm docs`, allow `vm ...` in the harness's command allowlist, state the guardrails below.
 
 ## Small models (Haiku-class)
 
-A small model may not reliably open and digest `README.md` on its own. Instead of the pointer,
-paste this self-contained snippet into its system prompt / CLAUDE.md — it needs no other reading:
+A small model may not reliably run `vm docs` and digest it. Instead of the pointer, paste this
+self-contained snippet into its system prompt / CLAUDE.md — it needs no other reading:
 
 ```md
 ## Test VM — exact commands (the `vm` CLI is on PATH; run from the project dir)
@@ -77,8 +68,8 @@ Never run `vm vm revert/reset/stop/snapshot` unless the user asks.
 Write only under /home/user/work/ on the VM. Never retry a failing command more than twice.
 ```
 
-Also install the `vm-recovery` skill (step 3 above) — it is written as numbered steps with
-expected outputs and stop conditions, which small models follow much better than prose.
+Also install the `vm-recovery` skill (step 3) — numbered steps with expected outputs and stop
+conditions, which small models follow much better than prose.
 
 ## Guardrails to state to any agent
 

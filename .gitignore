@@ -12,3 +12,6 @@ dist/
 # Staged tool binaries can be large; keep the convention docs, ignore the payloads.
 provision/*
 !provision/README.md
+
+# Generated at build time by setup.py from the repo-root originals.
+vm_cli/_docs/

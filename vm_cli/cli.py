@@ -27,6 +27,11 @@ import tempfile
 import time
 
 try:
+    from vm_cli import docs
+except ImportError:  # running this file directly, not as `python -m vm_cli.cli`
+    import docs
+
+try:
     import paramiko
 except ImportError:
     sys.stderr.write("error: paramiko is required (pip install paramiko)\n")
@@ -1429,6 +1434,15 @@ def build_parser():
     sub.add_parser("mount", help="(optional) sshfs live-bind staging dir via WSL")
     sub.add_parser("umount", help="(optional) unmount the WSL sshfs bind")
 
+    # docs (no config needed)
+    s = sub.add_parser("docs", help="print the packaged README (usage reference)")
+    s.add_argument("--skill", action="store_true",
+                   help="print the vm-recovery SKILL.md instead of the README")
+    s.add_argument("--path", action="store_true",
+                   help="print the file's path instead of its contents")
+    s.add_argument("--install-skill", metavar="DIR", nargs="?", const=".",
+                   help="write SKILL.md to DIR/.claude/skills/vm-recovery/ (default: .)")
+
     return p
 
 
@@ -1446,10 +1460,52 @@ def resolve_config_path(args):
 GUEST_VERBS = {"run", "push", "pull", "sync", "build-run", "snap", "verify", "waitfile"}
 
 
+def write_stdout_utf8(text):
+    """Write text to stdout as UTF-8, bypassing the console's legacy codepage.
+
+    The docs contain non-ASCII (arrows, dashes) that a cp1252 stdout can't encode.
+    """
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is None:  # stdout replaced (tests, pipes) -- best effort
+        sys.stdout.write(text)
+        return
+    sys.stdout.flush()
+    buf.write(text.encode("utf-8"))
+    buf.flush()
+
+
+def cmd_docs(args):
+    """Print (or install) documentation shipped inside the package."""
+    if args.install_skill is not None:
+        try:
+            dest = docs.install_skill(args.install_skill)
+        except (IOError, OSError) as e:
+            die("could not install skill: %s" % e)
+        status("installed %s" % dest)
+        return 0
+
+    name = "skill" if args.skill else "readme"
+    if args.path:
+        path = docs.doc_path(name)
+        if path is None:
+            die("%s is not packaged with this install" % docs.DOCS[name])
+        write_stdout_utf8(path + "\n")
+        return 0
+    text = docs.read_doc(name)
+    if text is None:
+        die("%s is not packaged with this install" % docs.DOCS[name])
+    write_stdout_utf8(text if text.endswith("\n") else text + "\n")
+    return 0
+
+
 def main(argv=None):
     global PROJECT_DIR
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # docs is self-contained: no config, no VM, works from any directory.
+    if args.verb == "docs":
+        return cmd_docs(args)
 
     config_path = resolve_config_path(args)
     PROJECT_DIR = os.path.dirname(os.path.abspath(config_path))
