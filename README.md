@@ -1,6 +1,8 @@
-# vm — cheat sheet
+# vm - an automation cli
 
-CLI to drive test VMs: guest control over SSH (paramiko) + host control over VMware (`vmrun`), primarily to be used by AI agents. 
+CLI to drive test VMs: guest control over SSH (paramiko) + host control over VMware (`vmrun`), primarily to be used by AI agents.
+
+Why? Drive a vm with an LLM in a repeatable way for product testing.
 
 One entrypoint: `vm [--vm NAME] <verb> ...`. Success = one status line; errors go to stderr
 with a real message + propagated exit code. (Package `vm-automation-cli`, import `vm_cli`.)
@@ -11,6 +13,8 @@ pip install .                               # installs the `vm` and `vm-init` co
 vm-init                                     # pick your VMs; writes config + folders
 vm vm doctor                                # all checks should PASS
 ```
+To wire the tool into Claude Code or another coding agent, see `INSTALL.md`.
+
 `vm-init` is interactive: it finds the VMs VMware knows about (running + registered), auto-detects
 each guest's OS and IP, prompts for user/password/snapshot, and writes `vmconfig.json` plus the
 `staging/` and `provision/` folders in the current directory. Re-run it any time to add more VMs
@@ -20,9 +24,7 @@ config by hand instead, `copy vmconfig.example.json vmconfig.json` and edit.
 Config lookup: `--config PATH`, else `$VM_CONFIG`, else `vmconfig.json` in the working directory —
 so `vm` finds the config (and `provision/`) in whatever project you run it from. `vmconfig.json` is
 gitignored (holds passwords). `default_vm` is used when `--vm` is omitted. Running from source
-without installing? Use `python -m vm_cli.cli <verb>` and `python -m vm_cli.init`. To wire the tool
-into Claude Code or another coding agent, see `INSTALL.md`.
-
+without installing? Use `python -m vm_cli.cli <verb>` and `python -m vm_cli.init`.
 ## Verbs
 
 **Guest (SSH):**
