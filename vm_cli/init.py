@@ -292,9 +292,25 @@ def guess_os(guestos):
     return "windows" if "win" in (guestos or "").lower() else "linux"
 
 
-def get_ip(vmrun, vmx, timeout=25):
+def vmx_is_encrypted(vmrun, vmx, timeout=20):
+    """True if vmrun refuses to open the VM without an encryption password.
+
+    Windows 11 guests carry a vTPM, which requires the VM be encrypted; vmrun
+    then needs -vp to open it at all. Detected by the tell-tale error on a cheap
+    command, so init can prompt for the password before trying to read the IP.
+    """
     try:
-        p = subprocess.run([vmrun, "getGuestIPAddress", vmx, "-wait"],
+        p = subprocess.run([vmrun, "checkToolsState", vmx],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return False
+    return "a password is required" in ((p.stderr or "") + (p.stdout or "")).lower()
+
+
+def get_ip(vmrun, vmx, enc_pw="", timeout=25):
+    pre = ["-vp", enc_pw] if enc_pw else []
+    try:
+        p = subprocess.run([vmrun] + pre + ["getGuestIPAddress", vmx, "-wait"],
                            capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
@@ -346,10 +362,17 @@ def collect_vm(vmrun, vmx, meta, running):
     if os_type not in ("linux", "windows"):
         os_type = "linux"
 
+    # Encrypted VMs (Windows 11 vTPM) can't be opened by vmrun without -vp, so
+    # ask for the password up front -- otherwise IP detection below silently fails.
+    enc_pw = ""
+    if vmx_is_encrypted(vmrun, vmx):
+        print("  this VM is encrypted (Windows 11 vTPM?); vmrun needs its password")
+        enc_pw = ask_secret("  encryption/TPM password")
+
     host = ""
     if vmx in running:
         print("  detecting guest IP...")
-        host = get_ip(vmrun, vmx) or ""
+        host = get_ip(vmrun, vmx, enc_pw) or ""
         if not host:
             print("  (could not detect IP; leaving blank - use `vm ip --save` later)")
     else:
@@ -378,6 +401,8 @@ def collect_vm(vmrun, vmx, meta, running):
         "tools_remote": d["tools_remote"],
         "wsl_distro": detect_default_wsl_distro() or "",
     }
+    if enc_pw:
+        block["encryption_password"] = enc_pw
     return name, block
 
 
@@ -547,7 +572,15 @@ def main(argv=None):
         print("  created:   %s" % ", ".join(os.path.relpath(m, args.dir) for m in made))
     if agents:
         print("  AGENTS.md: appended 'Test VM' section")
-    print("\nNext: vm vm doctor")
+
+    win = [n for n in added if (cfg["vms"].get(n) or {}).get("os") == "windows"]
+    print("\nNext:")
+    for n in win:
+        print("  vm --vm %s vm setup-ssh   # enable OpenSSH in the guest" % n)
+    if win:
+        print("  (a freshly-created Windows VM may need one reboot first so VMware")
+        print("   Tools can launch programs; setup-ssh will tell you if so)")
+    print("  vm vm doctor")
     return 0
 
 

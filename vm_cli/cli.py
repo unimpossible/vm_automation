@@ -722,18 +722,40 @@ def vmrun_path(cfg):
     return p
 
 
-def run_vmrun(cfg, vmrun_args, timeout=120):
-    """Invoke vmrun.exe with the given args; return (rc, stdout, stderr)."""
+def encryption_password(vm):
+    """The VM's encryption/TPM password, or "" if the VM isn't encrypted.
+
+    Windows 11 guests carry a vTPM, which VMware requires the VM be encrypted
+    to hold; vmrun then needs this password (via -vp) just to open the VM.
+    """
+    if not vm:
+        return ""
+    return (vm.get("encryption_password") or "").strip()
+
+
+def run_vmrun(cfg, vmrun_args, timeout=120, vm=None):
+    """Invoke vmrun.exe with the given args; return (rc, stdout, stderr).
+
+    When `vm` is encrypted, its password is injected via -vp so vmrun can open
+    it. If vmrun reports the VM needs a password we didn't supply, fail with an
+    actionable hint pointing at the config field rather than looping on it.
+    """
     exe = vmrun_path(cfg)
     if not os.path.isfile(exe):
         die("vmrun.exe not found: %s" % exe)
-    cmd = [exe] + vmrun_args
+    vp = encryption_password(vm)
+    prefix = ["-vp", vp] if vp else []
+    cmd = [exe] + prefix + vmrun_args
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         die("vmrun timed out: %s" % " ".join(vmrun_args), EXIT_TIMEOUT)
     except FileNotFoundError:
         die("cannot execute vmrun: %s" % exe)
+    if "a password is required" in (p.stderr or "").lower() and not vp:
+        die("VM is encrypted (Windows 11 vTPM?) and vmrun cannot open it "
+            "without the encryption password. Add \"encryption_password\": "
+            "\"<password>\" to this VM's config block.", EXIT_ENV)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -762,11 +784,22 @@ try {
   Start-Service sshd
   $o += 'sshd=' + (Get-Service sshd).Status
 } catch { $o += 'sshd_err=' + $_.Exception.Message }
-if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
-  New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
-    -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
-  $o += 'firewall=created'
-} else { $o += 'firewall=present' }
+# A fresh Win11 VM on VMware NAT is usually classified as a Public network, but
+# the OpenSSH capability's default inbound rule is scoped to Private/Domain, so
+# port 22 stays blocked. Force the rule to exist, be enabled, and apply to ALL
+# profiles -- don't just skip when a (wrongly-scoped) rule is already present.
+try {
+  $fw = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
+  if ($fw) {
+    Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True -Profile Any
+    $o += 'firewall=updated'
+  } else {
+    New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
+      -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 `
+      -Profile Any | Out-Null
+    $o += 'firewall=created'
+  }
+} catch { $o += 'firewall_err=' + $_.Exception.Message }
 $o | Out-File -FilePath 'C:\Windows\Temp\vm_setup_ssh.out' -Encoding ascii
 """
 
@@ -778,7 +811,42 @@ def _vmrun_guest(cfg, vm, op_args, timeout=180):
         die("VM has no default_user for guest operations")
     pw = user_password(vm, user)
     args = ["-T", "ws", "-gu", user, "-gp", pw] + op_args
-    return run_vmrun(cfg, args, timeout=timeout)
+    return run_vmrun(cfg, args, timeout=timeout, vm=vm)
+
+
+# Probe path in a location any standard user can write, so a non-admin
+# default_user doesn't fail the check for the wrong reason.
+_EXEC_PROBE_PATH = "C:\\Users\\Public\\vm_exec_probe.txt"
+
+
+def _guest_can_launch_programs(cfg, vm, wait=12):
+    """Return True if VMware Tools can actually LAUNCH a program in the guest.
+
+    A freshly-created Windows guest sometimes has a half-initialized Tools
+    guest-ops channel: auth, queries (listProcessesInGuest) and file copies all
+    work, but StartProgram silently no-ops -- and a wait-mode runProgramInGuest
+    then blocks for the full timeout. We detect that here cheaply: fire a trivial
+    program with -noWait (which can't hang) and see whether its marker file shows
+    up. If it never does, program launch is dead.
+    """
+    vmx = vmx_path(vm)
+    # Clear any stale marker (ignore "not found").
+    _vmrun_guest(cfg, vm, ["deleteFileInGuest", vmx, _EXEC_PROBE_PATH], timeout=30)
+    cmd = "C:\\Windows\\System32\\cmd.exe"
+    _vmrun_guest(cfg, vm,
+                 ["runProgramInGuest", vmx, "-noWait", cmd, "/c",
+                  "echo ok> " + _EXEC_PROBE_PATH],
+                 timeout=30)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        rc, out, err = _vmrun_guest(
+            cfg, vm, ["fileExistsInGuest", vmx, _EXEC_PROBE_PATH], timeout=30)
+        if "the file exists" in (out or "").lower():
+            _vmrun_guest(cfg, vm,
+                         ["deleteFileInGuest", vmx, _EXEC_PROBE_PATH], timeout=30)
+            return True
+        time.sleep(2)
+    return False
 
 
 def bootstrap_windows_ssh(cfg, vm):
@@ -790,10 +858,21 @@ def bootstrap_windows_ssh(cfg, vm):
         return False
     vmx = vmx_path(vm)
     # Tools must be up for guest ops to work at all.
-    rc, out, err = run_vmrun(cfg, ["checkToolsState", vmx], timeout=60)
+    rc, out, err = run_vmrun(cfg, ["checkToolsState", vmx], timeout=60, vm=vm)
     state = out.strip()
     if state != "running":
         die("VMware Tools not running in guest (state=%s); can't bootstrap SSH" % (state or "?"))
+
+    # Preflight: confirm Tools can actually launch a program before we copy and
+    # run the (wait-mode) setup script, which would otherwise hang for minutes.
+    if not _guest_can_launch_programs(cfg, vm):
+        die("VMware Tools is up and authenticates, but cannot launch programs in "
+            "the guest (StartProgram no-ops) -- so SSH can't be bootstrapped over "
+            "Tools. This is common on a freshly-created Windows VM. Fix: reboot "
+            "the guest and retry; if it persists, reinstall/repair VMware Tools "
+            "and reboot. Workaround: enable OpenSSH manually in the guest "
+            "(Add-WindowsCapability OpenSSH.Server; Start-Service sshd) -- once "
+            "sshd is up, the SSH verbs work without Tools.", EXIT_ENV)
 
     ps = "C:\\Windows\\Temp\\vm_setup_ssh.ps1"
     fd, tmp = tempfile.mkstemp(suffix=".ps1")
@@ -828,7 +907,7 @@ def cmd_vm_snapshot(cfg, vm, args):
     snap = args.snap or vm.get("snapshot")
     if not snap:
         die("no snapshot name given and no 'snapshot' in config")
-    rc, out, err = run_vmrun(cfg, ["snapshot", vmx_path(vm), snap])
+    rc, out, err = run_vmrun(cfg, ["snapshot", vmx_path(vm), snap], vm=vm)
     if rc != 0:
         die("vmrun snapshot failed: %s" % (err or out).strip(), rc or 1)
     status("snapshot taken: %s" % snap)
@@ -839,7 +918,7 @@ def cmd_vm_revert(cfg, vm, args):
     snap = args.snap or vm.get("snapshot")
     if not snap:
         die("no snapshot name given and no 'snapshot' in config")
-    rc, out, err = run_vmrun(cfg, ["revertToSnapshot", vmx_path(vm), snap])
+    rc, out, err = run_vmrun(cfg, ["revertToSnapshot", vmx_path(vm), snap], vm=vm)
     if rc != 0:
         die("vmrun revert failed: %s" % (err or out).strip(), rc or 1)
     status("reverted to snapshot: %s" % snap)
@@ -847,7 +926,7 @@ def cmd_vm_revert(cfg, vm, args):
 
 
 def cmd_vm_start(cfg, vm, args):
-    rc, out, err = run_vmrun(cfg, ["start", vmx_path(vm), "nogui"])
+    rc, out, err = run_vmrun(cfg, ["start", vmx_path(vm), "nogui"], vm=vm)
     if rc != 0:
         die("vmrun start failed: %s" % (err or out).strip(), rc or 1)
     status("started")
@@ -855,10 +934,10 @@ def cmd_vm_start(cfg, vm, args):
 
 
 def cmd_vm_stop(cfg, vm, args):
-    rc, out, err = run_vmrun(cfg, ["stop", vmx_path(vm), "soft"])
+    rc, out, err = run_vmrun(cfg, ["stop", vmx_path(vm), "soft"], vm=vm)
     if rc != 0:
         # try hard stop as fallback
-        rc, out, err = run_vmrun(cfg, ["stop", vmx_path(vm), "hard"])
+        rc, out, err = run_vmrun(cfg, ["stop", vmx_path(vm), "hard"], vm=vm)
         if rc != 0:
             die("vmrun stop failed: %s" % (err or out).strip(), rc or 1)
     status("stopped")
@@ -874,7 +953,7 @@ def cmd_vm_list(cfg, vm, args):
 
 
 def cmd_vm_snapshots(cfg, vm, args):
-    rc, out, err = run_vmrun(cfg, ["listSnapshots", vmx_path(vm)])
+    rc, out, err = run_vmrun(cfg, ["listSnapshots", vmx_path(vm)], vm=vm)
     if rc != 0:
         die("vmrun listSnapshots failed: %s" % (err or out).strip(), rc or 1)
     sys.stdout.write(out)
@@ -886,7 +965,7 @@ def _get_ip(cfg, vm, retries=30, delay=2):
     last = ""
     for _ in range(retries):
         rc, out, err = run_vmrun(cfg, ["getGuestIPAddress", vmx_path(vm), "-wait"],
-                                 timeout=60)
+                                 timeout=60, vm=vm)
         ip = out.strip()
         if rc == 0 and ip and ip[0].isdigit():
             return ip
@@ -935,11 +1014,11 @@ def cmd_vm_reset(cfg, vm, vm_name, args, config_path):
     snap = vm.get("snapshot")
     if not snap:
         die("no 'snapshot' configured for reset")
-    rc, out, err = run_vmrun(cfg, ["revertToSnapshot", vmx_path(vm), snap])
+    rc, out, err = run_vmrun(cfg, ["revertToSnapshot", vmx_path(vm), snap], vm=vm)
     if rc != 0:
         die("revert failed: %s" % (err or out).strip(), rc or 1)
     status("reverted to %s" % snap)
-    rc, out, err = run_vmrun(cfg, ["start", vmx_path(vm), "nogui"])
+    rc, out, err = run_vmrun(cfg, ["start", vmx_path(vm), "nogui"], vm=vm)
     if rc != 0:
         die("start failed: %s" % (err or out).strip(), rc or 1)
     status("powered on; discovering IP...")

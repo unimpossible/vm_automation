@@ -93,6 +93,34 @@ for you over VMware Tools — no manual step:
 - Use forward slashes in remote paths (`C:/Users/IEUser/staging`). `run` executes in `cmd.exe`.
 - `push` / `pull` / `sync` / `run` work. `build-run`, `--as`, and sudo are Linux-only.
 
+### Windows 11 (encrypted / vTPM) guests
+
+Windows 11 requires a vTPM, which VMware only provides on an **encrypted** VM — and `vmrun`
+can't open an encrypted VM (to read its IP, run guest ops, etc.) without the encryption password.
+Put it in the VM block:
+
+```json
+"encryption_password": "your-vm-encryption-password"
+```
+
+`vm-init` detects encryption and prompts for it automatically. With it set, the normal flow works:
+
+```
+vm-init                          # detects the VM, asks for the encryption password
+vm --vm <NAME> vm setup-ssh      # installs OpenSSH + opens the firewall on all profiles
+vm --vm <NAME> vm doctor         # verify
+```
+
+Two Win11-specific gotchas `vm` now handles for you:
+
+- **First-boot VMware Tools:** a freshly-created guest often can't *launch* programs over Tools
+  until it has rebooted once (auth and file ops work, process launch silently no-ops). `setup-ssh`
+  detects this and fails fast telling you to reboot, instead of hanging. Reboot the guest once, then
+  re-run.
+- **Firewall profile:** VMware's NAT network is usually classified *Public*, and OpenSSH's default
+  rule only allows Private/Domain — so port 22 stays blocked. `setup-ssh` forces the inbound rule to
+  apply to all profiles.
+
 ## Exit codes
 - Remote command's rc passes through for `run` / `build-run`.
 - `124` = timeout.

@@ -21,6 +21,7 @@
       "os": "windows",
       "host": "192.168.0.101",
       "vmx": "E:\\Path\\To\\VMs\\mywinvm\\mywinvm.vmx",
+      "encryption_password": "CHANGE_ME_IF_VM_IS_ENCRYPTED",
       "snapshot": "clean",
       "default_user": "IEUser",
       "users": {
