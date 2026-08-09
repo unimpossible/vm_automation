@@ -1,0 +1,3 @@
+# SKILL.md must reach the sdist so a wheel built from it can stage vm_cli/_docs/
+# (README.md is included automatically via project.readme).
+include SKILL.md

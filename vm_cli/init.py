@@ -48,6 +48,7 @@ A local VM is available for running and testing code, driven by the `vm` CLI (on
 - `vm sync <dir>` - bulk-upload a directory
 - `vm build-run <src>` - upload, compile, and run a source file (Linux)
 - `vm vm doctor` - health check; `vm vm reset` - restore the clean snapshot
+- `vm docs` - print the full usage reference (read this before first use)
 
 Config is `vmconfig.json` in this directory (created by `vm-init`). Tools placed in
 `provision/<vm>/` are auto-installed into the guest on first use and added to PATH.
