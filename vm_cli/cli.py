@@ -3,7 +3,7 @@
 
 Single-file tool for driving test VMs from a Windows host, designed for low token overhead.
 
-  Guest (SSH/paramiko):  run, push, pull, sync, build-run, snap, verify, waitfile
+  Guest (SSH/paramiko):  run, push, pull, sync, build-run, snap, verify, waitfile, port
   Host  (vmrun.exe):     vm snapshot|revert|reset|start|stop|list|snapshots|ip|doctor
   Optional (WSL sshfs):  mount, umount
 
@@ -17,10 +17,13 @@ import argparse
 import base64
 import glob
 import hashlib
+import html
 import json
 import os
 import posixpath
+import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -272,11 +275,46 @@ def _sftp_or_none(client):
         return None
 
 
+def _win_ps_b64_decode_cmd(remote):
+    """Build a `powershell -EncodedCommand ...` line that reads base64 from stdin,
+    creates the destination's parent dir, and writes the decoded bytes to `remote`.
+
+    The script is passed as -EncodedCommand (UTF-16LE base64) so the guest's
+    default cmd.exe shell never has to quote it -- the command line is pure base64.
+    The file's own base64 is streamed on stdin, so large files don't hit the
+    command-line length limit."""
+    dst = remote.replace("/", "\\").replace("'", "''")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$dst='%s';"
+        "$dir=Split-Path -Parent $dst;"
+        # Guard on existence: New-Item on an already-present dir (e.g. a drive
+        # root like C:\) throws "path is not of a legal form", not a no-op.
+        "if($dir -and -not(Test-Path -LiteralPath $dir)){"
+        "New-Item -ItemType Directory -Force -Path $dir|Out-Null};"
+        "$b=[Console]::In.ReadToEnd();"
+        "[IO.File]::WriteAllBytes($dst,[Convert]::FromBase64String($b))"
+    ) % dst
+    enc = base64.b64encode(script.encode("utf-16-le")).decode()
+    return "powershell -NoProfile -NonInteractive -EncodedCommand %s" % enc
+
+
 def _push_b64(client, vm, local, remote):
-    """Fallback upload: base64 the local file, decode over exec on the guest."""
+    """Fallback upload: base64 the local file, decode over exec on the guest.
+
+    Linux decodes with `base64 -d`; Windows (cmd.exe shell, no `base64`) decodes
+    with an inline PowerShell one-liner. Both stream the base64 over stdin."""
     with open(local, "rb") as f:
         data = f.read()
     b64 = base64.b64encode(data).decode()
+
+    if guest_os(vm) == "windows":
+        rc, out, err = exec_command(client, vm, _win_ps_b64_decode_cmd(remote),
+                                    timeout=DEFAULT_TIMEOUT, stdin_data=b64.encode())
+        if rc != 0:
+            die("base64 push failed on Windows guest: %s" % err.decode(errors="replace"))
+        return
+
     # ensure parent dir exists, then decode into place
     parent = posixpath.dirname(remote)
     prep = "mkdir -p %s && cat > /tmp/.vmpush.b64" % shlex.quote(parent or ".")
@@ -314,6 +352,30 @@ def _ensure_remote_dir(client, vm, sftp, remote_dir):
         exec_command(client, vm, "mkdir -p %s" % shlex.quote(remote_dir), timeout=30)
 
 
+def _remote_is_dir(client, vm, sftp, path):
+    """True if `path` already exists as a directory on the guest.
+
+    Used to give `push FILE DEST` cp-style semantics: a DEST that is an existing
+    directory receives FILE by its basename, rather than being overwritten as a
+    literal file path. Prefers a cheap SFTP stat; falls back to a shell test."""
+    if not path:
+        return False
+    if sftp is not None:
+        try:
+            return stat.S_ISDIR(sftp.stat(path).st_mode)
+        except IOError:
+            return False
+    if guest_os(vm) == "windows":
+        script = ("if(Test-Path -LiteralPath '%s' -PathType Container){exit 0}"
+                  "else{exit 1}") % path.replace("/", "\\").replace("'", "''")
+        enc = base64.b64encode(script.encode("utf-16-le")).decode()
+        cmd = "powershell -NoProfile -NonInteractive -EncodedCommand %s" % enc
+    else:
+        cmd = "test -d %s" % shlex.quote(path)
+    rc, _out, _err = exec_command(client, vm, cmd, timeout=30)
+    return rc == 0
+
+
 def _push_file(client, vm, local, remote, sftp):
     """Upload one file; SFTP if available, base64-over-exec fallback. Returns method used."""
     if sftp is not None:
@@ -323,8 +385,6 @@ def _push_file(client, vm, local, remote, sftp):
             return "sftp"
         except Exception:
             pass
-    if guest_os(vm) == "windows":
-        die("SFTP upload failed and there is no base64 fallback on Windows guests")
     _push_b64(client, vm, local, remote)
     return "base64"
 
@@ -351,6 +411,16 @@ def _rel_component(path):
     if norm.startswith("/") or drive_like or os.path.splitdrive(path)[0] or ".." in parts:
         return parts[-1] if parts else os.path.basename(path)
     return "/".join(parts) if parts else os.path.basename(path)
+
+
+def _strip_top_component(comp, top):
+    """Drop the leading `top/` from a rel component (as produced by
+    _expand_sources for a directory), so the directory's *contents* map to the
+    destination root. `top` itself (the empty-dir marker) collapses to ""."""
+    if comp == top:
+        return ""
+    prefix = top + "/"
+    return comp[len(prefix):] if comp.startswith(prefix) else comp
 
 
 def _expand_sources(paths):
@@ -411,11 +481,25 @@ def cmd_push(client, vm, args):
     if not pairs:
         die("nothing to push")
 
+    # A single directory source + explicit dest means dest *becomes* that
+    # directory: its contents map directly under dest, rather than nesting the
+    # source directory's own name beneath dest. Mirrors `rsync src/ dest`:
+    #   push .../files c:\files  ->  c:\files\file1.txt, c:\files\dir\extra.txt
+    single_dir = (dest is not None and len(sources) == 1
+                  and not _has_glob(sources[0]) and os.path.isdir(sources[0]))
+    if single_dir:
+        top = _rel_component(sources[0])
+        pairs = [(lf, _strip_top_component(comp, top)) for lf, comp in pairs]
+
     sftp = _sftp_or_none(client)
     try:
-        # Single file + explicit dest = literal remote path (cp-style rename).
-        if dest is not None and len(pairs) == 1 and pairs[0][0] is not None:
+        # Single file + explicit dest: a literal remote path (cp-style rename),
+        # unless dest is an existing guest directory -- then drop the file into
+        # it by basename (cp FILE DIR/), rather than overwriting the directory.
+        if not single_dir and dest is not None and len(pairs) == 1 and pairs[0][0] is not None:
             local, remote = pairs[0][0], dest
+            if _remote_is_dir(client, vm, sftp, dest):
+                remote = posixpath.join(dest, os.path.basename(local))
             used = _push_file(client, vm, local, remote, sftp)
             status("pushed %s -> %s (%s)" % (local, remote, used))
             return 0
@@ -717,6 +801,143 @@ def cmd_waitfile(client, vm, args):
         if time.time() >= deadline:
             die("waitfile timed out after %ss: %s" % (timeout, path), EXIT_TIMEOUT)
         time.sleep(poll)
+
+
+# --- Port verbs (guest firewall) ---------------------------------------------
+# The host can already reach the guest IP (that's how SSH gets in), so "opening a
+# port" is only a guest-side firewall edit -- no host process, no state file. The
+# rules live in the guest, which means `vm snapshot` bakes them in and `vm revert`
+# drops them. Linux rules are matched by their own spec; Windows rules are named
+# vm-port-<port>-<proto> so close/list can find them again.
+def _sudo_exec(client, vm, cmd, timeout=60):
+    """Run a command as root on a Linux guest; returns (rc, stdout, stderr) as text."""
+    pw = user_password(vm, vm.get("default_user"))
+    rc, out, err = exec_command(client, vm, "sudo -S -p '' %s" % cmd,
+                                timeout=timeout, stdin_data=(pw + "\n").encode())
+    return rc, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+def _linux_fw(client, vm):
+    """Pick the guest's firewall: ufw when it's installed AND active, else iptables.
+
+    An inactive ufw enforces nothing, so editing it would be a silent no-op --
+    and its rules would override ours the moment it came up.
+    """
+    rc, out, _ = _sudo_exec(client, vm, "ufw status", timeout=30)
+    if rc == 0 and "inactive" not in out.lower():
+        return "ufw"
+    rc, _, err = _sudo_exec(client, vm, "iptables -S INPUT", timeout=30)
+    if rc == 0:
+        return "iptables"
+    die("no usable firewall in the guest (ufw not active; iptables: %s)" % err.strip())
+
+
+def _clean_ps_err(text):
+    """Flatten PowerShell's CLIXML stderr into one readable line.
+
+    powershell.exe serializes stderr as CLIXML whenever it's redirected -- which
+    it always is over SSH -- so a plain error arrives as a wall of XML wrapped
+    around the message. Pull out the error strings and drop the parser trace.
+    """
+    if not text.lstrip().startswith("#< CLIXML"):
+        return text
+    body = html.unescape("".join(re.findall(r'<S S="Error">(.*?)</S>', text, re.S)))
+    body = body.replace("_x000D_", "").replace("_x000A_", "\n")
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    return " ".join(ln for ln in lines
+                    if not re.match(r"(At line:|\+|CategoryInfo|FullyQualified)", ln))
+
+
+def _win_ps(client, vm, script, timeout=60):
+    """Run PowerShell in a Windows guest via -EncodedCommand (no cmd.exe quoting)."""
+    full = "$ErrorActionPreference='Stop';" + script
+    enc = base64.b64encode(full.encode("utf-16-le")).decode()
+    rc, out, err = exec_command(
+        client, vm, "powershell -NoProfile -NonInteractive -EncodedCommand %s" % enc,
+        timeout=timeout)
+    return rc, out.decode(errors="replace"), _clean_ps_err(err.decode(errors="replace"))
+
+
+def _port_apply(client, vm, action, port, proto):
+    """Open or close one inbound port in the guest firewall. Returns the backend used."""
+    if guest_os(vm) == "windows":
+        rule = "vm-port-%d-%s" % (port, proto)
+        if action == "open":
+            # Reuse an existing rule instead of failing on a duplicate name, and
+            # force Profile Any: VMware's NAT network is classified Public.
+            script = ("$n='%s';"
+                      "if(Get-NetFirewallRule -Name $n -ErrorAction SilentlyContinue)"
+                      "{Set-NetFirewallRule -Name $n -Enabled True -Profile Any}"
+                      "else{New-NetFirewallRule -Name $n -DisplayName $n "
+                      "-Direction Inbound -Action Allow -Protocol %s -LocalPort %d "
+                      "-Profile Any|Out-Null}" % (rule, proto.upper(), port))
+        else:
+            script = "Remove-NetFirewallRule -Name '%s'" % rule
+        rc, out, err = _win_ps(client, vm, script)
+        if rc != 0:
+            die("%s %d/%s failed: %s" % (action, port, proto, (err or out).strip()))
+        return "windows firewall"
+
+    fw = _linux_fw(client, vm)
+    if fw == "ufw":
+        cmd = "ufw %s %d/%s" % ("allow" if action == "open" else "delete allow", port, proto)
+    else:
+        # -D takes the same spec as -I, so no rule numbers or comments to track.
+        cmd = "iptables %s INPUT -p %s --dport %d -j ACCEPT" % (
+            "-I" if action == "open" else "-D", proto, port)
+    rc, out, err = _sudo_exec(client, vm, cmd)
+    if rc != 0:
+        die("%s failed: %s" % (cmd, (err or out).strip()))
+    return fw
+
+
+def _port_list(client, vm):
+    """Return (backend, ["8080/tcp", ...]) of inbound ports the guest firewall allows."""
+    if guest_os(vm) == "windows":
+        # Only rules `vm port open` made: the name carries the port, and listing
+        # every built-in Windows allow rule would be noise, not an answer.
+        rc, out, err = _win_ps(client, vm,
+                               "Get-NetFirewallRule -Name 'vm-port-*' "
+                               "-ErrorAction SilentlyContinue|"
+                               "ForEach-Object{($_.Name -replace '^vm-port-','')"
+                               " -replace '-','/'}")
+        if rc != 0:
+            die("could not list firewall rules: %s" % (err or out).strip())
+        return "windows firewall", out.split()
+
+    fw = _linux_fw(client, vm)
+    if fw == "ufw":
+        rc, out, err = _sudo_exec(client, vm, "ufw status")
+        # "8080/tcp   ALLOW   Anywhere" -- the v6 twin reads "8080/tcp (v6) ALLOW",
+        # so anchoring ALLOW to the second column dedupes it for free.
+        ports = [ln.split()[0] for ln in out.splitlines()
+                 if re.match(r"^\d+(/(tcp|udp))?\s+ALLOW\b", ln)]
+    else:
+        rc, out, err = _sudo_exec(client, vm, "iptables -S INPUT")
+        ports = ["%s/%s" % (m.group(2), m.group(1)) for m in
+                 re.finditer(r"-p (tcp|udp).*?--dport (\d+).*?-j ACCEPT", out)]
+    if rc != 0:
+        die("could not list firewall rules: %s" % (err or out).strip())
+    return fw, ports
+
+
+def cmd_port(client, vm, args):
+    """port open|close|list -- inbound ports in the guest's own firewall."""
+    if args.portverb == "list":
+        fw, ports = _port_list(client, vm)
+        for p in ports:
+            print(p)
+        status("%d open (%s)" % (len(ports), fw))
+        return 0
+
+    proto = args.proto.lower()
+    if not 1 <= args.port <= 65535:
+        die("port must be 1-65535, got %d" % args.port)
+    fw = _port_apply(client, vm, args.portverb, args.port, proto)
+    status("%s %d/%s on %s (%s)" % (
+        "opened" if args.portverb == "open" else "closed",
+        args.port, proto, vm.get("host"), fw))
+    return 0
 
 
 # --- Host / vmrun ------------------------------------------------------------
@@ -1490,6 +1711,16 @@ def build_parser():
     s.add_argument("path")
     s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="max wait (s)")
 
+    # port (guest firewall)
+    s = sub.add_parser("port", help="open/close/list inbound ports in the guest firewall")
+    psub = s.add_subparsers(dest="portverb", required=True)
+    for act, h in (("open", "allow inbound traffic to a port"),
+                   ("close", "remove the rule `port open` added")):
+        x = psub.add_parser(act, help=h)
+        x.add_argument("port", type=int)
+        x.add_argument("--proto", choices=["tcp", "udp"], default="tcp")
+    psub.add_parser("list", help="list inbound ports the guest firewall allows")
+
     # vm (host control)
     s = sub.add_parser("vm", help="host-side VMware control via vmrun")
     vsub = s.add_subparsers(dest="vmverb", required=True)
@@ -1536,7 +1767,8 @@ def resolve_config_path(args):
 
 
 # Verbs that need an SSH client vs those that are host-only.
-GUEST_VERBS = {"run", "push", "pull", "sync", "build-run", "snap", "verify", "waitfile"}
+GUEST_VERBS = {"run", "push", "pull", "sync", "build-run", "snap", "verify", "waitfile",
+               "port"}
 
 
 def write_stdout_utf8(text):
@@ -1646,6 +1878,8 @@ def main(argv=None):
                 return cmd_verify(client, vm, args)
             if verb == "waitfile":
                 return cmd_waitfile(client, vm, args)
+            if verb == "port":
+                return cmd_port(client, vm, args)
         finally:
             try:
                 client.close()

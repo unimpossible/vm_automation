@@ -1,8 +1,19 @@
 # vm - an automation cli
 
-CLI to drive test VMs — guest control over SSH (paramiko) + host control over VMware (`vmrun`) —
-built for AI agents, so an LLM can drive a VM repeatably for product testing.
+**Give an AI agent a real VM it can safely break.** `vm` is one command that lets an LLM run code
+in a throwaway VMware VM, push and pull files, and reset to a clean snapshot when things go
+sideways — so you can test software, reproduce bugs, or run untrusted code without touching your
+own machine.
 
+Why reach for it:
+- **A sandbox your agent can drive itself.** One verb-based command, predictable output — an LLM can
+  run a build, read the result, and recover from a wrecked VM without you in the loop.
+- **Reset is one call.** `vm reset` rolls back to a clean snapshot and reconnects, so every test run
+  starts from the same known-good state.
+- **Linux and Windows guests, same commands.** SSH is set up (and enabled on Windows) for you; you
+  just `run`, `push`, and `pull`.
+
+Guest control is over SSH (paramiko); host control (power, snapshots) is over VMware (`vmrun`).
 One entrypoint: `vm [--vm NAME] <verb> ...`. Success = one status line; errors go to stderr with a
 real message and a propagated exit code. (Package `vm-automation-cli`, import `vm_cli`.)
 
@@ -37,6 +48,7 @@ To wire this into Claude Code or another coding agent, see `INSTALL.md`.
 | `snap` | `<path>` | print baseline line `inode mtime size sha256` |
 | `verify` | `<path> --baseline "<line>" [--token STR]` | print CREATED\|MODIFIED\|UNCHANGED + token check |
 | `waitfile` | `<path> [--timeout N]` | block until file appears (pre-existing file is deleted first, then watched for recreation) |
+| `port` | `open\|close <N> [--proto tcp\|udp]`, `list` | open/close/list inbound ports in the guest's own firewall |
 
 **Host (vmrun):**
 | verb | args | purpose |
@@ -77,6 +89,32 @@ makes `run "strace -V"` work. No manifest; the folder is the config. See `provis
   and the next command restages. Force with `vm provision --force`.
 - **Bake it in:** provision once, then `vm snapshot clean`, so every `vm reset` restores a
   fully-loaded guest for free.
+
+## Opening a port to the guest
+
+The host can already reach the guest's IP -- that's how SSH gets in -- so `port open` isn't a
+tunnel, it just removes the guest's own firewall block:
+
+```
+vm port open 8080                  # allow inbound tcp/8080
+vm port open 5353 --proto udp
+vm port list                       # what's allowed now
+vm port close 8080
+```
+
+Then reach the service at `<vm ip>:8080`. Two things to know:
+
+- **Bind to `0.0.0.0`, not `127.0.0.1`.** A firewall rule can't reach a loopback-only service --
+  no port is open to find. Start the guest service on all interfaces.
+- **The rules live in the guest**, so `vm snapshot` bakes them in and `vm revert` drops them --
+  there's no host-side process or state file to clean up.
+
+Backend per guest, chosen for you: **ufw** when it's installed and active, else **iptables**
+(raw iptables rules don't survive a guest reboot -- re-run `port open`, or snapshot with them in
+place). On **Windows** it's a `New-NetFirewallRule` named `vm-port-<port>-<proto>`, scoped to all
+profiles because VMware's NAT network is classified *Public*. `port list` reflects that split: on
+Linux it reports every allow-by-port rule it can see, on Windows only the rules `port open` created
+(listing every built-in Windows rule would be noise, not an answer).
 
 ## Windows guests
 
