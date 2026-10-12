@@ -29,9 +29,12 @@ to add VMs (it merges); `--agents` also drops a "Test VM" section into `./AGENTS
 by hand, copy `vmconfig.example.json` instead. From source, without installing:
 `python -m vm_cli.cli <verb>` / `python -m vm_cli.init`.
 
-Config lookup: `--config PATH`, else `$VM_CONFIG`, else `vmconfig.json` in the working directory —
-so `vm` finds the config (and `provision/`) in whatever project you run it from. It holds passwords
-and is gitignored. `default_vm` is used when `--vm` is omitted.
+Config lookup: `--config PATH`, else `$VM_CONFIG`, else the nearest `vmconfig.json` found by
+searching the working directory, then each parent up to the filesystem root, then your home
+directory (`~/vmconfig.json` or `~/.vmconfig.json`). So `vm` works from any subdirectory of a
+project, and a home copy covers running outside one entirely. Whichever file wins also anchors
+`provision/` and `staging/`, which sit beside it. It holds passwords and is gitignored.
+`default_vm` is used when `--vm` is omitted.
 
 To wire this into Claude Code or another coding agent, see `INSTALL.md`.
 

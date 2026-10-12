@@ -1756,14 +1756,48 @@ def build_parser():
     return p
 
 
+CONFIG_NAME = "vmconfig.json"
+
+
+def config_candidates():
+    """Where an implicit config may live, nearest first.
+
+    The working directory, then each parent up to the filesystem root, then the
+    home directory. Walking up means `vm` works from any subdirectory of a
+    project; the home copy is the fallback for running outside one entirely.
+    """
+    paths = []
+    d = os.getcwd()
+    while True:
+        paths.append(os.path.join(d, CONFIG_NAME))
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    home = os.path.expanduser("~")
+    paths.append(os.path.join(home, CONFIG_NAME))
+    paths.append(os.path.join(home, "." + CONFIG_NAME))
+    return paths
+
+
 def resolve_config_path(args):
+    """--config wins, then $VM_CONFIG, then the nearest config found by searching up.
+
+    Whichever file wins also sets PROJECT_DIR, so provision/ and staging/ anchor
+    beside the config rather than wherever the command happened to be run.
+    """
     if args.config:
         return args.config
     env = os.environ.get("VM_CONFIG")
     if env:
         return env
-    # Default to vmconfig.json in the working directory (the user's project).
-    return os.path.join(os.getcwd(), "vmconfig.json")
+    for path in config_candidates():
+        if os.path.isfile(path):
+            return path
+    die("no %s found in %s, any parent directory, or %s\n"
+        "first-time setup: run `vm-init` here to create %s, "
+        "then run: vm vm doctor" % (CONFIG_NAME, os.getcwd(),
+                                    os.path.expanduser("~"), CONFIG_NAME))
 
 
 # Verbs that need an SSH client vs those that are host-only.

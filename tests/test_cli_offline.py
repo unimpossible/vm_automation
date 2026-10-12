@@ -21,6 +21,15 @@ def _run_cli(args, timeout=30):
     return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
 
+def _run_cli_in(cwd, args, env=None, timeout=30):
+    """Same, but from a chosen working directory (and optionally a patched env),
+    so the implicit config search can be exercised."""
+    cmd = [sys.executable, "-m", VM_MODULE] + list(args)
+    p = subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=str(cwd),
+                       env=dict(env or os.environ, PYTHONPATH=_REPO_ROOT))
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
 @pytest.mark.offline
 def test_help_exits_zero():
     rc, out, err = _run_cli(["--help"])
@@ -55,3 +64,31 @@ def test_unknown_vm_exits_125_and_lists_known(tmp_path):
     rc, out, err = _run_cli(["--config", str(path), "--vm", "doesnotexist", "run", "true"])
     assert rc == 125, "unknown VM should exit 125, got %d" % rc
     assert "doesnotexist" in err and "somevm" in err, "error should name the bad and known VMs"
+
+
+@pytest.mark.offline
+def test_config_found_in_parent_directory(tmp_path):
+    """With no config in cwd, the search walks up and finds the project's."""
+    cfg = {"vms": {"somevm": {"os": "linux", "host": "10.255.255.1",
+                              "default_user": "user",
+                              "users": {"user": {"password": "x"}}}}}
+    (tmp_path / "vmconfig.json").write_text(json.dumps(cfg), encoding="utf-8")
+    deep = tmp_path / "sub" / "deeper"
+    deep.mkdir(parents=True)
+    # Reaching "cannot connect" proves the config was found and parsed; the
+    # unroutable host is what fails, not the lookup.
+    rc, out, err = _run_cli_in(deep, ["--vm", "somevm", "run", "true"], timeout=60)
+    assert rc == 125, "rc=%d stderr=%r" % (rc, err)
+    assert "cannot connect" in err, "expected a connect error, got %r" % err
+
+
+@pytest.mark.offline
+def test_no_config_anywhere_names_where_it_looked(tmp_path):
+    """With nothing to find, the error names cwd and the home directory."""
+    home = tmp_path / "home"
+    home.mkdir()
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+    rc, out, err = _run_cli_in(tmp_path, ["run", "true"], env=env, timeout=60)
+    assert rc == 125, "rc=%d stderr=%r" % (rc, err)
+    assert "no vmconfig.json found" in err and "parent directory" in err, err
+    assert "vm-init" in err, "error should point at first-time setup: %r" % err
