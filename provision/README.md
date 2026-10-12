@@ -1,6 +1,6 @@
 # provision/ — tools staged into the guest on first run
 
-Drop files here and they get copied into the guest's tools dir the first time vm.py
+Drop files here and they get copied into the guest's tools dir the first time `vm`
 connects (and are made executable on Linux). No manifest — the folder *is* the config.
 
 ## Layout
@@ -11,7 +11,7 @@ provision/
   <os>/          # e.g. linux/ or windows/  — fallback when there's no per-VM folder
 ```
 
-For a given VM, vm.py uses `provision/<vm-name>/` if it exists, else `provision/<os>/`.
+For a given VM, `vm` uses `provision/<vm-name>/` if it exists, else `provision/<os>/`.
 Everything in that folder is synced (recursively) to the guest **tools dir**
 (`tools_remote` in config, default `<home>/tools`), which `run` automatically prepends
 to `PATH`. So `provision/myvm/strace` → `run "strace -V"` just works.
@@ -32,7 +32,8 @@ that's the sign to move to a real provisioner (Ansible, etc.) instead.
 
 - Automatically on the first guest command, if the folder changed since last time
   (tracked by a hash in `<tools>/.provisioned`). Unchanged = fast no-op.
-- On demand: `python vm.py --vm NAME vm provision` (add `--force` to re-stage).
+- On demand: `vm --vm NAME provision` (add `--force` to re-stage).
+- Skip automatic staging/setup for a guest command with `--no-provision`.
 
 ## Bake it into the snapshot
 

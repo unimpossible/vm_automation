@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""vm.py - Generic VM automation CLI (guest control over SSH + host control over VMware).
+"""VM automation CLI: guest commands over SSH and host control over VMware.
 
-Single-file tool for driving test VMs from a Windows host, designed for low token overhead.
+Guest commands use SSH; VMware power and snapshot commands use vmrun.
 
   Guest (SSH/paramiko):  run, push, pull, sync, build-run, snap, verify, waitfile, port
   Host  (vmrun.exe):     vm snapshot|revert|reset|start|stop|list|snapshots|ip|doctor
   Optional (WSL sshfs):  mount, umount
 
-Usage:  python vm.py [--vm NAME] [--config PATH] <verb> ...
+Usage:  vm [--vm NAME] [--config PATH] <verb> ...
 
 Exit codes:  remote rc passes through for `run`/`build-run`;
              124 = timeout, 125 = can't connect / config error / bad usage, 0 = success.
@@ -18,6 +18,7 @@ import base64
 import glob
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import posixpath
@@ -44,7 +45,7 @@ except ImportError:
 EXIT_TIMEOUT = 124
 EXIT_ENV = 125  # can't connect / config error / bad usage
 
-CONNECT_TIMEOUT = 10   # paramiko TCP/auth timeout (seconds)
+CONNECT_TIMEOUT = 10  # paramiko TCP/auth timeout (seconds)
 DEFAULT_TIMEOUT = 120  # default remote command timeout (seconds)
 
 # Directory the config lives in; provision/ and other project files anchor here.
@@ -67,14 +68,39 @@ def status(msg):
 # --- Config ------------------------------------------------------------------
 def load_config(path):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(path, "r", encoding="utf-8") as file:
+            config = json.load(file)
     except FileNotFoundError:
-        die("config file not found: %s\n"
+        die(
+            "config file not found: %s\n"
             "first-time setup: run `vm-init` here to create vmconfig.json, "
-            "then run: vm vm doctor" % path)
-    except json.JSONDecodeError as e:
-        die("config file is not valid JSON: %s" % e)
+            "then run: vm doctor" % path
+        )
+    except json.JSONDecodeError as error:
+        die("config file is not valid JSON: %s" % error)
+    except (OSError, UnicodeError) as error:
+        die("cannot read config %s: %s" % (path, error))
+    if not isinstance(config, dict):
+        die("config must be a JSON object")
+    vms = config.get("vms", {})
+    if not isinstance(vms, dict) or any(
+        not isinstance(vm, dict) for vm in vms.values()
+    ):
+        die("config 'vms' must map VM names to objects")
+    if config.get("vmrun") is not None and not isinstance(config["vmrun"], str):
+        die("config 'vmrun' must be a path string")
+    for name, vm in vms.items():
+        for key in ("os", "host", "default_user", "vmx", "encryption_password"):
+            if vm.get(key) is not None and not isinstance(vm[key], str):
+                die("vms.%s.%s must be a string" % (name, key))
+        if vm.get("os") and guest_os(vm) not in {"linux", "windows"}:
+            die("vms.%s.os must be linux or windows" % name)
+        users = vm.get("users", {})
+        if not isinstance(users, dict) or any(
+            not isinstance(user, dict) for user in users.values()
+        ):
+            die("vms.%s.users must map usernames to objects" % name)
+    return config
 
 
 def resolve_vm(cfg, name):
@@ -84,8 +110,15 @@ def resolve_vm(cfg, name):
         die("no VMs defined in config")
     if name is None:
         name = cfg.get("default_vm")
+    if name is None and len(vms) == 1:
+        name = next(iter(vms))
     if name is None:
-        die("no --vm given and no default_vm in config")
+        die(
+            "choose a VM with --vm NAME (known: %s), or set default_vm"
+            % ", ".join(sorted(vms))
+        )
+    if not isinstance(name, str):
+        die("default_vm must be a VM name")
     if name not in vms:
         die("unknown VM %r (known: %s)" % (name, ", ".join(sorted(vms))))
     return name, vms[name]
@@ -93,16 +126,18 @@ def resolve_vm(cfg, name):
 
 def atomic_write_json(path, data):
     """Write JSON atomically: temp file in same dir + os.replace."""
-    d = os.path.dirname(os.path.abspath(path)) or "."
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".vmconfig.", suffix=".tmp")
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        dir=directory, prefix=".vmconfig.", suffix=".tmp"
+    )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-        os.replace(tmp, path)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2)
+            file.write("\n")
+        os.replace(temporary_path, path)
     except BaseException:
         try:
-            os.unlink(tmp)
+            os.unlink(temporary_path)
         except OSError:
             pass
         raise
@@ -110,9 +145,14 @@ def atomic_write_json(path, data):
 
 def user_password(vm, user):
     users = vm.get("users") or {}
-    if user not in users:
-        die("user %r not configured for this VM" % user)
-    return users[user].get("password", "")
+    if not isinstance(users, dict) or user not in users:
+        raise ValueError("user %r not configured for this VM" % user)
+    account = users[user]
+    if not isinstance(account, dict) or not isinstance(
+        account.get("password", ""), str
+    ):
+        raise ValueError("users.%s must be an object with a string password" % user)
+    return account.get("password", "")
 
 
 def guest_os(vm):
@@ -124,9 +164,9 @@ def tools_remote(vm):
     """Guest dir where staged tools live and which `run` prepends to PATH.
 
     Config key `tools_remote` overrides the default (<home>/tools)."""
-    t = vm.get("tools_remote")
-    if t:
-        return t
+    configured_path = vm.get("tools_remote")
+    if configured_path:
+        return configured_path
     user = vm.get("default_user") or "user"
     if guest_os(vm) == "windows":
         return "C:/Users/%s/tools" % user
@@ -142,130 +182,226 @@ def _wrap_tools_path(vm, cmd):
 
 
 # --- SSH ---------------------------------------------------------------------
-def _ssh_open(vm):
+def _ssh_open(vm, timeout=CONNECT_TIMEOUT, user=None):
     """Attempt one paramiko connection; return client or raise."""
     host = vm.get("host")
     if not host:
-        die("VM has no host/IP configured")
-    user = vm.get("default_user")
+        raise ValueError("VM has no host/IP configured (run: vm ip --save)")
+    user = user or vm.get("default_user")
     if not user:
-        die("VM has no default_user configured")
+        raise ValueError("VM has no default_user configured")
+    port = vm.get("ssh_port", 22)
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("ssh_port must be an integer in 1-65535")
     password = user_password(vm, user)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        username=user,
-        password=password,
-        timeout=CONNECT_TIMEOUT,
-        banner_timeout=CONNECT_TIMEOUT,
-        auth_timeout=CONNECT_TIMEOUT,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+    try:
+        client.connect(
+            hostname=host,
+            port=port,
+            username=user,
+            password=password,
+            timeout=timeout,
+            banner_timeout=timeout,
+            auth_timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        client.get_transport().set_keepalive(30)
+    except Exception:
+        client.close()
+        raise
     return client
 
 
 def ssh_connect(cfg, vm):
-    """Open a paramiko SSHClient to the VM's default_user. Fail fast on a dead VM.
+    """Connect once, then recover a stale VMware IP after a network failure.
 
-    On a Windows VM whose SSH isn't up yet, bootstrap OpenSSH once over the
-    VMware Tools channel (no manual in-guest step) and retry.
+    Authentication and config failures never trigger guest setup. A discovered
+    address is used in memory; `vm ip --save` explicitly persists it.
     """
     user = vm.get("default_user")
     host = vm.get("host")
     try:
         return _ssh_open(vm)
-    except Exception as e:
-        if guest_os(vm) == "windows":
-            status("SSH not reachable; enabling OpenSSH in the Windows guest...")
-            if bootstrap_windows_ssh(cfg, vm):
-                try:
-                    return _ssh_open(vm)
-                except Exception as e2:
-                    die("Windows guest bootstrap ran but SSH still refused: %s" % e2,
-                        EXIT_ENV)
-        die("cannot connect to %s@%s: %s" % (user, host, e), EXIT_ENV)
+    except Exception as connection_error:
+        error = connection_error
+    if isinstance(error, paramiko.AuthenticationException):
+        die(
+            "SSH authentication failed for %s@%s; check users.%s.password in config"
+            % (user, host, user)
+        )
+    if isinstance(error, (ValueError, paramiko.BadHostKeyException)):
+        die(str(error))
+    if not isinstance(error, (OSError, EOFError, paramiko.SSHException)):
+        die("cannot connect to %s@%s: %s" % (user, host, error))
 
+    # Tools can report a DHCP address that changed since init or a snapshot.
+    # No -wait and one short attempt: a powered-off VM must still fail promptly.
+    ip = None
+    if cfg.get("vmrun") and os.path.isfile(cfg["vmrun"]) and vm.get("vmx"):
+        ip = _get_ip(cfg, vm, retries=1, delay=0, timeout=3)
+    if ip and ip != host:
+        status(
+            "configured IP %s is unreachable; retrying VMware IP %s "
+            "(persist with: vm ip --save)" % (host, ip)
+        )
+        host = ip
+        vm["host"] = ip
+        try:
+            return _ssh_open(vm)
+        except paramiko.AuthenticationException:
+            die(
+                "SSH authentication failed for %s@%s; check users.%s.password in config"
+                % (user, host, user)
+            )
+        except Exception as connection_error:
+            error = connection_error
 
-def _read_all(chan, timeout):
-    """Drive a channel to completion within timeout; return (rc, stdout, stderr)."""
-    chan.settimeout(1.0)
-    out = bytearray()
-    err = bytearray()
-    deadline = time.time() + timeout
-    while True:
-        while chan.recv_ready():
-            out += chan.recv(65536)
-        while chan.recv_stderr_ready():
-            err += chan.recv_stderr(65536)
-        if chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready():
-            break
-        if time.time() > deadline:
+    # Only a refused TCP connection suggests SSH is absent. Timeouts, auth
+    # failures and protocol errors are not evidence that Windows needs an install.
+    refused = isinstance(error, ConnectionRefusedError) or (
+        isinstance(error, paramiko.ssh_exception.NoValidConnectionsError)
+        and all(
+            isinstance(connection_error, ConnectionRefusedError)
+            for connection_error in error.errors.values()
+        )
+    )
+    if guest_os(vm) == "windows" and refused and ip and vm.get("ssh_port", 22) == 22:
+        status("SSH not reachable; enabling OpenSSH in the Windows guest...")
+        if bootstrap_windows_ssh(cfg, vm):
             try:
-                chan.close()
-            except Exception:
-                pass
+                return _ssh_open(vm)
+            except Exception as bootstrap_error:
+                die(
+                    "Windows guest bootstrap ran but SSH still refused: %s"
+                    % bootstrap_error,
+                    EXIT_ENV,
+                )
+    die(
+        "cannot connect to %s@%s: %s\n"
+        "check that the VM is powered on; run: vm ip --save, then vm doctor"
+        % (user, host, error),
+        EXIT_ENV,
+    )
+
+
+def _read_all(chan, timeout, stream=False):
+    """Drain both channels fairly; streaming forwards bytes without retaining them."""
+    chan.settimeout(1.0)
+    stdout = bytearray()
+    stderr = bytearray()
+    deadline = time.monotonic() + timeout
+
+    def check_timeout():
+        if time.monotonic() >= deadline:
+            chan.close()
             raise TimeoutError("command timed out after %ss" % timeout)
-        time.sleep(0.05)
+
+    while True:
+        if chan.recv_ready():
+            check_timeout()
+            chunk = chan.recv(65536)
+            if stream:
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+            else:
+                stdout += chunk
+        if chan.recv_stderr_ready():
+            check_timeout()
+            chunk = chan.recv_stderr(65536)
+            if stream:
+                sys.stderr.buffer.write(chunk)
+                sys.stderr.buffer.flush()
+            else:
+                stderr += chunk
+        if (
+            chan.exit_status_ready()
+            and not chan.recv_ready()
+            and not chan.recv_stderr_ready()
+        ):
+            break
+        check_timeout()
+        if not chan.recv_ready() and not chan.recv_stderr_ready():
+            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     # drain any remainder
     while chan.recv_ready():
-        out += chan.recv(65536)
+        stdout += chan.recv(65536)
     while chan.recv_stderr_ready():
-        err += chan.recv_stderr(65536)
-    rc = chan.recv_exit_status()
-    return rc, bytes(out), bytes(err)
+        stderr += chan.recv_stderr(65536)
+    return_code = chan.recv_exit_status()
+    return return_code, bytes(stdout), bytes(stderr)
 
 
-def exec_command(client, vm, cmd, as_user=None, timeout=DEFAULT_TIMEOUT, stdin_data=None):
+def exec_command(
+    client,
+    vm,
+    cmd,
+    as_user=None,
+    timeout=DEFAULT_TIMEOUT,
+    stdin_data=None,
+    stream=False,
+):
     """Run a command on the guest. --as USER wraps it in piped `sudo -S`.
 
-    Returns (rc, stdout_bytes, stderr_bytes). Raises TimeoutError on timeout.
+    Returns (rc, stdout_bytes, stderr_bytes). With stream=True, output is forwarded
+    immediately and returned byte strings are empty. Raises TimeoutError on timeout.
     """
     transport = client.get_transport()
-    chan = transport.open_session()
-    chan.settimeout(timeout)
-
-    if as_user is not None:
-        pw = user_password(vm, as_user)
-        # feed password on stdin to `sudo -S`; run the command as that user's login shell
-        wrapped = "sudo -S -p '' -u %s -- bash -c %s" % (
-            shlex.quote(as_user), shlex.quote(cmd))
-        chan.exec_command(wrapped)
-        feed = (pw + "\n").encode()
-        if stdin_data is not None:
-            feed += stdin_data
-        try:
-            chan.sendall(feed)
-        except Exception:
-            pass
-        chan.shutdown_write()
-    else:
-        chan.exec_command(cmd)
-        if stdin_data is not None:
+    if transport is None or not transport.is_active():
+        raise paramiko.SSHException("SSH connection closed before command execution")
+    deadline = time.monotonic() + timeout
+    channel = transport.open_session(timeout=timeout)
+    try:
+        channel.settimeout(timeout)
+        input_data = stdin_data
+        if as_user is not None:
+            user_password(vm, as_user)  # validate the requested identity
+            password = user_password(vm, vm.get("default_user"))
+            # sudo authenticates the invoking SSH user, not the target user.
+            cmd = "sudo -S -p '' -u %s -- bash -c %s" % (
+                shlex.quote(as_user),
+                shlex.quote(cmd),
+            )
+            input_data = (password + "\n").encode() + (stdin_data or b"")
+        channel.exec_command(cmd)
+        if input_data is not None:
             try:
-                chan.sendall(stdin_data)
-            except Exception:
+                channel.sendall(input_data)
+            except OSError:
+                # A command may exit before consuming stdin; collect its rc.
                 pass
-        chan.shutdown_write()
-
-    return _read_all(chan, timeout)
+        channel.shutdown_write()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("command timed out after %ss" % timeout)
+        if stream:
+            return _read_all(channel, remaining, stream=True)
+        return _read_all(channel, remaining)
+    finally:
+        channel.close()
 
 
 # --- Guest verbs -------------------------------------------------------------
 def cmd_run(client, vm, args):
     try:
-        rc, out, err = exec_command(
-            client, vm, _wrap_tools_path(vm, args.command),
-            as_user=args.as_user, timeout=args.timeout)
-    except TimeoutError as e:
-        die(str(e), EXIT_TIMEOUT)
-    sys.stdout.buffer.write(out)
+        return_code, stdout, stderr = exec_command(
+            client,
+            vm,
+            _wrap_tools_path(vm, args.command),
+            as_user=args.as_user,
+            timeout=args.timeout,
+            stream=True,
+        )
+    except TimeoutError as error:
+        die(str(error), EXIT_TIMEOUT)
+    sys.stdout.buffer.write(stdout)
     sys.stdout.buffer.flush()
-    if err:
-        sys.stderr.buffer.write(err)
+    if stderr:
+        sys.stderr.buffer.write(stderr)
         sys.stderr.buffer.flush()
-    return rc
+    return return_code
 
 
 def _sftp_or_none(client):
@@ -283,7 +419,7 @@ def _win_ps_b64_decode_cmd(remote):
     default cmd.exe shell never has to quote it -- the command line is pure base64.
     The file's own base64 is streamed on stdin, so large files don't hit the
     command-line length limit."""
-    dst = remote.replace("/", "\\").replace("'", "''")
+    destination = remote.replace("/", "\\").replace("'", "''")
     script = (
         "$ErrorActionPreference='Stop';"
         "$dst='%s';"
@@ -294,9 +430,9 @@ def _win_ps_b64_decode_cmd(remote):
         "New-Item -ItemType Directory -Force -Path $dir|Out-Null};"
         "$b=[Console]::In.ReadToEnd();"
         "[IO.File]::WriteAllBytes($dst,[Convert]::FromBase64String($b))"
-    ) % dst
-    enc = base64.b64encode(script.encode("utf-16-le")).decode()
-    return "powershell -NoProfile -NonInteractive -EncodedCommand %s" % enc
+    ) % destination
+    encoded_script = base64.b64encode(script.encode("utf-16-le")).decode()
+    return "powershell -NoProfile -NonInteractive -EncodedCommand %s" % encoded_script
 
 
 def _push_b64(client, vm, local, remote):
@@ -304,30 +440,37 @@ def _push_b64(client, vm, local, remote):
 
     Linux decodes with `base64 -d`; Windows (cmd.exe shell, no `base64`) decodes
     with an inline PowerShell one-liner. Both stream the base64 over stdin."""
-    with open(local, "rb") as f:
-        data = f.read()
-    b64 = base64.b64encode(data).decode()
+    with open(local, "rb") as file:
+        data = file.read()
+    encoded_data = base64.b64encode(data).decode()
 
     if guest_os(vm) == "windows":
-        rc, out, err = exec_command(client, vm, _win_ps_b64_decode_cmd(remote),
-                                    timeout=DEFAULT_TIMEOUT, stdin_data=b64.encode())
-        if rc != 0:
-            die("base64 push failed on Windows guest: %s" % err.decode(errors="replace"))
+        return_code, stdout, stderr = exec_command(
+            client,
+            vm,
+            _win_ps_b64_decode_cmd(remote),
+            timeout=DEFAULT_TIMEOUT,
+            stdin_data=encoded_data.encode(),
+        )
+        if return_code != 0:
+            die(
+                "base64 push failed on Windows guest: %s"
+                % stderr.decode(errors="replace")
+            )
         return
 
-    # ensure parent dir exists, then decode into place
+    # Stream straight to the destination; a shared /tmp file races other pushes.
     parent = posixpath.dirname(remote)
-    prep = "mkdir -p %s && cat > /tmp/.vmpush.b64" % shlex.quote(parent or ".")
-    rc, out, err = exec_command(client, vm, prep, timeout=DEFAULT_TIMEOUT,
-                                stdin_data=b64.encode())
-    if rc != 0:
-        die("base64 push prep failed: %s" % err.decode(errors="replace"))
-    rc, out, err = exec_command(
-        client, vm,
-        "base64 -d /tmp/.vmpush.b64 > %s && rm -f /tmp/.vmpush.b64" % shlex.quote(remote),
-        timeout=DEFAULT_TIMEOUT)
-    if rc != 0:
-        die("base64 push decode failed: %s" % err.decode(errors="replace"))
+    return_code, stdout, stderr = exec_command(
+        client,
+        vm,
+        "mkdir -p %s && base64 -d > %s"
+        % (shlex.quote(parent or "."), shlex.quote(remote)),
+        timeout=DEFAULT_TIMEOUT,
+        stdin_data=encoded_data.encode(),
+    )
+    if return_code != 0:
+        die("base64 push decode failed: %s" % stderr.decode(errors="replace"))
 
 
 def _ensure_remote_dir(client, vm, sftp, remote_dir):
@@ -339,17 +482,24 @@ def _ensure_remote_dir(client, vm, sftp, remote_dir):
         if sftp is None:
             return
         parts = remote_dir.replace("\\", "/").split("/")
-        cur = ""
-        for p in parts:
-            if not p:
+        current_path = ""
+        for part in parts:
+            if not part:
                 continue
-            cur = p if not cur else cur + "/" + p
+            current_path = part if not current_path else current_path + "/" + part
             try:
-                sftp.mkdir(cur)
+                sftp.mkdir(current_path)
             except IOError:
                 pass  # already exists
     else:
-        exec_command(client, vm, "mkdir -p %s" % shlex.quote(remote_dir), timeout=30)
+        return_code, stdout, stderr = exec_command(
+            client, vm, "mkdir -p %s" % shlex.quote(remote_dir), timeout=30
+        )
+        if return_code != 0:
+            die(
+                "could not create remote dir %s: %s"
+                % (remote_dir, stderr.decode(errors="replace").strip())
+            )
 
 
 def _remote_is_dir(client, vm, sftp, path):
@@ -366,14 +516,17 @@ def _remote_is_dir(client, vm, sftp, path):
         except IOError:
             return False
     if guest_os(vm) == "windows":
-        script = ("if(Test-Path -LiteralPath '%s' -PathType Container){exit 0}"
-                  "else{exit 1}") % path.replace("/", "\\").replace("'", "''")
-        enc = base64.b64encode(script.encode("utf-16-le")).decode()
-        cmd = "powershell -NoProfile -NonInteractive -EncodedCommand %s" % enc
+        script = (
+            "if(Test-Path -LiteralPath '%s' -PathType Container){exit 0}" "else{exit 1}"
+        ) % path.replace("/", "\\").replace("'", "''")
+        encoded_script = base64.b64encode(script.encode("utf-16-le")).decode()
+        command = (
+            "powershell -NoProfile -NonInteractive -EncodedCommand %s" % encoded_script
+        )
     else:
-        cmd = "test -d %s" % shlex.quote(path)
-    rc, _out, _err = exec_command(client, vm, cmd, timeout=30)
-    return rc == 0
+        command = "test -d %s" % shlex.quote(path)
+    return_code, _out, _err = exec_command(client, vm, command, timeout=30)
+    return return_code == 0
 
 
 def _push_file(client, vm, local, remote, sftp):
@@ -393,7 +546,7 @@ _GLOB_MAGIC = set("*?[")
 
 
 def _has_glob(s):
-    return any(c in s for c in _GLOB_MAGIC)
+    return any(character in s for character in _GLOB_MAGIC)
 
 
 def _rel_component(path):
@@ -403,12 +556,21 @@ def _rel_component(path):
     folder is recreated remotely). Falls back to the basename for absolute,
     drive-qualified, or `..`-containing paths, which must not leak a host-local
     layout (or escape) into the destination root."""
-    norm = path.replace("\\", "/").rstrip("/")
-    parts = [p for p in norm.split("/") if p not in ("", ".")]
+    normalized_path = path.replace("\\", "/").rstrip("/")
+    parts = [part for part in normalized_path.split("/") if part not in ("", ".")]
     # Detect a Windows drive (C:/...) explicitly: os.path.splitdrive only sees it
     # on Windows, but a drive-qualified path must flatten on any host.
-    drive_like = len(norm) >= 2 and norm[1] == ":" and norm[0].isalpha()
-    if norm.startswith("/") or drive_like or os.path.splitdrive(path)[0] or ".." in parts:
+    drive_like = (
+        len(normalized_path) >= 2
+        and normalized_path[1] == ":"
+        and normalized_path[0].isalpha()
+    )
+    if (
+        normalized_path.startswith("/")
+        or drive_like
+        or os.path.splitdrive(path)[0]
+        or ".." in parts
+    ):
         return parts[-1] if parts else os.path.basename(path)
     return "/".join(parts) if parts else os.path.basename(path)
 
@@ -420,7 +582,7 @@ def _strip_top_component(comp, top):
     if comp == top:
         return ""
     prefix = top + "/"
-    return comp[len(prefix):] if comp.startswith(prefix) else comp
+    return comp[len(prefix) :] if comp.startswith(prefix) else comp
 
 
 def _expand_sources(paths):
@@ -430,29 +592,33 @@ def _expand_sources(paths):
     (None, dir) marker if empty, so the remote dir is still created). Globs are
     expanded here because Windows shells don't expand them for the CLI."""
     pairs = []
-    for arg in paths:
-        if _has_glob(arg):
-            matches = sorted(glob.glob(arg, recursive=True))
+    for source_argument in paths:
+        if _has_glob(source_argument):
+            matches = sorted(glob.glob(source_argument, recursive=True))
             if not matches:
-                die("no files match: %s" % arg)
+                die("no files match: %s" % source_argument)
         else:
-            matches = [arg]
-        for m in matches:
-            if os.path.isdir(m):
-                top = _rel_component(m)
-                found = False
-                for root, _dirs, names in os.walk(m):
-                    for n in sorted(names):
-                        lf = os.path.join(root, n)
-                        rel = os.path.relpath(lf, m).replace(os.sep, "/")
-                        pairs.append((lf, posixpath.join(top, rel)))
-                        found = True
-                if not found:
-                    pairs.append((None, top))
-            elif os.path.isfile(m):
-                pairs.append((m, _rel_component(m)))
+            matches = [source_argument]
+        for matched_path in matches:
+            if os.path.isdir(matched_path):
+                source_root = _rel_component(matched_path)
+                found_files = False
+                for root, _dirs, names in os.walk(matched_path):
+                    for filename in sorted(names):
+                        local_file = os.path.join(root, filename)
+                        relative_path = os.path.relpath(
+                            local_file, matched_path
+                        ).replace(os.sep, "/")
+                        pairs.append(
+                            (local_file, posixpath.join(source_root, relative_path))
+                        )
+                        found_files = True
+                if not found_files:
+                    pairs.append((None, source_root))
+            elif os.path.isfile(matched_path):
+                pairs.append((matched_path, _rel_component(matched_path)))
             else:
-                die("local path not found: %s" % m)
+                die("local path not found: %s" % matched_path)
     return pairs
 
 
@@ -469,13 +635,16 @@ def cmd_push(client, vm, args):
     paths = args.paths
     # Destination detection: with 2+ args, a trailing arg that exists neither as
     # a local file/dir nor as a glob match is an explicit remote destination.
-    dest, sources = None, paths
-    if len(paths) >= 2:
-        last = paths[-1]
-        local_hit = os.path.exists(last) or (
-            _has_glob(last) and glob.glob(last, recursive=True))
-        if not local_hit:
-            dest, sources = last, paths[:-1]
+    destination = getattr(args, "dest", None)
+    sources = paths
+    if destination is None and len(paths) >= 2:
+        last_argument = paths[-1]
+        matches_local_source = os.path.exists(last_argument) or (
+            _has_glob(last_argument) and glob.glob(last_argument, recursive=True)
+        )
+        if not matches_local_source:
+            destination = last_argument
+            sources = paths[:-1]
 
     pairs = _expand_sources(sources)
     if not pairs:
@@ -485,37 +654,52 @@ def cmd_push(client, vm, args):
     # directory: its contents map directly under dest, rather than nesting the
     # source directory's own name beneath dest. Mirrors `rsync src/ dest`:
     #   push .../files c:\files  ->  c:\files\file1.txt, c:\files\dir\extra.txt
-    single_dir = (dest is not None and len(sources) == 1
-                  and not _has_glob(sources[0]) and os.path.isdir(sources[0]))
-    if single_dir:
-        top = _rel_component(sources[0])
-        pairs = [(lf, _strip_top_component(comp, top)) for lf, comp in pairs]
+    single_directory = (
+        destination is not None
+        and len(sources) == 1
+        and not _has_glob(sources[0])
+        and os.path.isdir(sources[0])
+    )
+    if single_directory:
+        source_root = _rel_component(sources[0])
+        pairs = [
+            (local_file, _strip_top_component(relative_path, source_root))
+            for local_file, relative_path in pairs
+        ]
 
     sftp = _sftp_or_none(client)
     try:
         # Single file + explicit dest: a literal remote path (cp-style rename),
         # unless dest is an existing guest directory -- then drop the file into
         # it by basename (cp FILE DIR/), rather than overwriting the directory.
-        if not single_dir and dest is not None and len(pairs) == 1 and pairs[0][0] is not None:
-            local, remote = pairs[0][0], dest
-            if _remote_is_dir(client, vm, sftp, dest):
-                remote = posixpath.join(dest, os.path.basename(local))
-            used = _push_file(client, vm, local, remote, sftp)
-            status("pushed %s -> %s (%s)" % (local, remote, used))
+        if (
+            not single_directory
+            and destination is not None
+            and len(pairs) == 1
+            and pairs[0][0] is not None
+        ):
+            local, remote = pairs[0][0], destination
+            if _remote_is_dir(client, vm, sftp, destination):
+                remote = posixpath.join(destination, os.path.basename(local))
+            transfer_method = _push_file(client, vm, local, remote, sftp)
+            status("pushed %s -> %s (%s)" % (local, remote, transfer_method))
             return 0
 
-        root = dest or vm.get("staging_remote") or "/tmp"
-        made, count, last_remote = set(), 0, None
-        for local, comp in pairs:
-            remote = posixpath.join(root, comp)
+        root = destination or vm.get("staging_remote") or "/tmp"
+        created_directories = set()
+        count = 0
+        last_remote = None
+        for local, relative_path in pairs:
+            remote = posixpath.join(root, relative_path)
             parent = posixpath.dirname(remote) if local is not None else remote
-            if parent and parent not in made:
+            if parent and parent not in created_directories:
                 _ensure_remote_dir(client, vm, sftp, parent)
-                made.add(parent)
+                created_directories.add(parent)
             if local is None:
                 continue  # empty directory: just created above
             _push_file(client, vm, local, remote, sftp)
-            count, last_remote = count + 1, remote
+            count += 1
+            last_remote = remote
         if count == 1:
             status("pushed %s -> %s" % (pairs[0][0], last_remote))
         else:
@@ -530,13 +714,22 @@ def cmd_push(client, vm, args):
 
 
 def _pull_b64(client, vm, remote, local):
-    rc, out, err = exec_command(
-        client, vm, "base64 %s" % shlex.quote(remote), timeout=DEFAULT_TIMEOUT)
-    if rc != 0:
-        die("base64 pull failed: %s" % err.decode(errors="replace"))
-    data = base64.b64decode(out)
-    with open(local, "wb") as f:
-        f.write(data)
+    if guest_os(vm) == "windows":
+        path = remote.replace("/", "\\").replace("'", "''")
+        script = "[Convert]::ToBase64String([IO.File]::ReadAllBytes('%s'))" % path
+        return_code, stdout, stderr = _win_ps(
+            client, vm, script, timeout=DEFAULT_TIMEOUT
+        )
+    else:
+        return_code, stdout, stderr = exec_command(
+            client, vm, "base64 %s" % shlex.quote(remote), timeout=DEFAULT_TIMEOUT
+        )
+        stderr = stderr.decode(errors="replace")
+    if return_code != 0:
+        die("base64 pull failed: %s" % stderr)
+    data = base64.b64decode(stdout)
+    with open(local, "wb") as file:
+        file.write(data)
 
 
 def cmd_pull(client, vm, args):
@@ -545,12 +738,12 @@ def cmd_pull(client, vm, args):
     if local and (os.path.isdir(local)):
         local = os.path.join(local, os.path.basename(remote))
     sftp = _sftp_or_none(client)
-    used = "sftp"
+    transfer_method = "sftp"
     if sftp is not None:
         try:
             sftp.get(remote, local)
         except Exception:
-            used = "base64"
+            transfer_method = "base64"
             _pull_b64(client, vm, remote, local)
         finally:
             try:
@@ -558,54 +751,59 @@ def cmd_pull(client, vm, args):
             except Exception:
                 pass
     else:
-        used = "base64"
+        transfer_method = "base64"
         _pull_b64(client, vm, remote, local)
-    status("pulled %s -> %s (%s)" % (remote, local, used))
+    status("pulled %s -> %s (%s)" % (remote, local, transfer_method))
     return 0
 
 
 def cmd_sync(client, vm, args):
-    localdir = args.localdir or vm.get("staging_local")
-    remotedir = args.remotedir or vm.get("staging_remote")
-    if not localdir:
+    local_directory = args.localdir or vm.get("staging_local")
+    if local_directory and args.localdir is None and not os.path.isabs(local_directory):
+        local_directory = os.path.join(PROJECT_DIR, local_directory)
+    remote_directory = args.remotedir or vm.get("staging_remote")
+    if not local_directory:
         die("no localdir given and no staging_local in config")
-    if not remotedir:
+    if not remote_directory:
         die("no remotedir given and no staging_remote in config")
-    if not os.path.isdir(localdir):
-        die("local dir not found: %s" % localdir)
+    if not os.path.isdir(local_directory):
+        die("local dir not found: %s" % local_directory)
 
     files = []
-    for root, _dirs, names in os.walk(localdir):
-        for n in names:
-            files.append(os.path.join(root, n))
+    for root, _dirs, names in os.walk(local_directory):
+        for filename in names:
+            files.append(os.path.join(root, filename))
 
     sftp = _sftp_or_none(client)
-    _ensure_remote_dir(client, vm, sftp, remotedir)
-    count = 0
-    made = set()
-    for lf in files:
-        rel = os.path.relpath(lf, localdir).replace(os.sep, "/")
-        rf = posixpath.join(remotedir, rel)
-        parent = posixpath.dirname(rf)
-        if parent and parent not in made:
-            _ensure_remote_dir(client, vm, sftp, parent)
-            made.add(parent)
-        ok = False
+    try:
+        _ensure_remote_dir(client, vm, sftp, remote_directory)
+        count = 0
+        created_directories = {remote_directory}
+        for local_file in files:
+            relative_path = os.path.relpath(local_file, local_directory).replace(
+                os.sep, "/"
+            )
+            remote_file = posixpath.join(remote_directory, relative_path)
+            parent = posixpath.dirname(remote_file)
+            if parent and parent not in created_directories:
+                _ensure_remote_dir(client, vm, sftp, parent)
+                created_directories.add(parent)
+            if sftp is not None:
+                try:
+                    sftp.put(local_file, remote_file)
+                    count += 1
+                    continue
+                except OSError:
+                    pass
+            _push_b64(client, vm, local_file, remote_file)
+            count += 1
+    finally:
         if sftp is not None:
             try:
-                sftp.put(lf, rf)
-                ok = True
+                sftp.close()
             except Exception:
-                ok = False
-        if not ok:
-            _push_b64(client, vm, lf, rf)
-        count += 1
-    if sftp is not None:
-        try:
-            sftp.close()
-        except Exception:
-            pass
-    status("synced %d file(s) %s -> %s" % (count, localdir, remotedir))
+                pass
+    status("synced %d file(s) %s -> %s" % (count, local_directory, remote_directory))
     return 0
 
 
@@ -622,33 +820,40 @@ def cmd_build_run(client, vm, args):
     local = args.source
     if not os.path.isfile(local):
         die("local source not found: %s" % local)
-    ext = os.path.splitext(local)[1].lower()
-    base = os.path.basename(local)
-    stem = os.path.splitext(base)[0] or "a"
+    extension = os.path.splitext(local)[1].lower()
+    source_name = os.path.basename(local)
+    source_stem = os.path.splitext(source_name)[0] or "a"
 
     # --dir: build into a caller-chosen remote dir and leave artifacts there.
     # Otherwise use a unique temp dir so concurrent agents don't collide.
-    user_dir = args.dir
-    if user_dir:
-        workdir = user_dir
-        rc, out, err = exec_command(client, vm, "mkdir -p %s" % shlex.quote(workdir), timeout=30)
-        if rc != 0:
-            die("could not create --dir %s: %s" % (workdir, err.decode(errors="replace")))
+    requested_directory = args.dir
+    if requested_directory:
+        work_directory = requested_directory
+        return_code, stdout, stderr = exec_command(
+            client, vm, "mkdir -p %s" % shlex.quote(work_directory), timeout=30
+        )
+        if return_code != 0:
+            die(
+                "could not create --dir %s: %s"
+                % (work_directory, stderr.decode(errors="replace"))
+            )
     else:
-        rc, out, err = exec_command(client, vm, "mktemp -d /tmp/vmbuild.XXXXXX", timeout=30)
-        if rc != 0:
-            die("mktemp failed: %s" % err.decode(errors="replace"))
-        workdir = out.decode().strip()
+        return_code, stdout, stderr = exec_command(
+            client, vm, "mktemp -d /tmp/vmbuild.XXXXXX", timeout=30
+        )
+        if return_code != 0:
+            die("mktemp failed: %s" % stderr.decode(errors="replace"))
+        work_directory = stdout.decode().strip()
     # Keep artifacts when the caller named the dir (that's the point) or asked with --keep.
-    keep = args.keep or bool(user_dir)
-    remote_src = posixpath.join(workdir, base)
+    keep = args.keep or bool(requested_directory)
+    remote_source = posixpath.join(work_directory, source_name)
 
     # upload source (sftp with base64 fallback)
     sftp = _sftp_or_none(client)
     pushed = False
     if sftp is not None:
         try:
-            sftp.put(local, remote_src)
+            sftp.put(local, remote_source)
             pushed = True
         except Exception:
             pushed = False
@@ -658,62 +863,75 @@ def cmd_build_run(client, vm, args):
             except Exception:
                 pass
     if not pushed:
-        _push_b64(client, vm, local, remote_src)
+        _push_b64(client, vm, local, remote_source)
 
     # Interpreted scripts authored on Windows carry CRLF, which breaks bash
     # (`exit 0\r: numeric argument required`) and shebang lines. Normalize to LF.
-    if ext in (".sh", ".py"):
-        exec_command(client, vm, "sed -i 's/\\r$//' " + shlex.quote(remote_src), timeout=30)
+    if extension in (".sh", ".py"):
+        exec_command(
+            client, vm, "sed -i 's/\\r$//' " + shlex.quote(remote_source), timeout=30
+        )
 
-    tmp_bin = posixpath.join(workdir, stem)
-    build = _build_cmd(remote_src, ext, tmp_bin)
-    if build is not None:
-        rc, out, err = exec_command(client, vm, build, timeout=args.timeout)
-        if rc != 0:
-            sys.stderr.buffer.write(err)
+    remote_binary = posixpath.join(work_directory, source_stem)
+    compile_command = _build_cmd(remote_source, extension, remote_binary)
+    if compile_command is not None:
+        return_code, stdout, stderr = exec_command(
+            client, vm, compile_command, timeout=args.timeout, stream=True
+        )
+        if return_code != 0:
+            sys.stderr.buffer.write(stderr)
             sys.stderr.buffer.flush()
-            _cleanup(client, vm, workdir, keep)
-            die("compile failed (rc=%d)" % rc, code=rc if rc else 1)
-        target = tmp_bin
+            _cleanup(client, vm, work_directory, keep)
+            die(
+                "compile failed (rc=%d)" % return_code,
+                code=return_code if return_code else 1,
+            )
+        target = remote_binary
     else:
         # interpreted: run the source itself
-        if ext == ".py":
-            target = "python3 " + shlex.quote(remote_src)
-        elif ext == ".sh":
-            target = "bash " + shlex.quote(remote_src)
+        if extension == ".py":
+            target = "python3 " + shlex.quote(remote_source)
+        elif extension == ".sh":
+            target = "bash " + shlex.quote(remote_source)
         else:
-            _cleanup(client, vm, workdir, keep)
-            die("don't know how to build/run %s" % ext)
+            _cleanup(client, vm, work_directory, keep)
+            die("don't know how to build/run %s" % extension)
 
     # A single --args value is a shell-style string: --args "1 2 3" means three
     # arguments. Multiple values pass through literally, so an argument with an
     # embedded space is still expressible: --args alpha "two words".
-    prog_args = list(args.args or [])
-    if len(prog_args) == 1:
-        prog_args = shlex.split(prog_args[0])
-    arg_str = " ".join(shlex.quote(a) for a in prog_args)
-    if build is not None:
-        run_cmd = "%s %s" % (shlex.quote(target), arg_str)
+    program_arguments = list(args.args or [])
+    if len(program_arguments) == 1:
+        program_arguments = shlex.split(program_arguments[0])
+    argument_string = " ".join(shlex.quote(argument) for argument in program_arguments)
+    if compile_command is not None:
+        run_command = "%s %s" % (shlex.quote(target), argument_string)
     else:
-        run_cmd = "%s %s" % (target, arg_str)
+        run_command = "%s %s" % (target, argument_string)
     # Run from the build dir so relative paths the program opens/creates land
     # next to its artifacts (matters most with --dir).
-    run_cmd = "cd %s && %s" % (shlex.quote(workdir), run_cmd.strip())
+    run_command = "cd %s && %s" % (shlex.quote(work_directory), run_command.strip())
 
     try:
-        rc, out, err = exec_command(
-            client, vm, run_cmd, as_user=args.as_user, timeout=args.timeout)
-    except TimeoutError as e:
-        _cleanup(client, vm, workdir, keep)
-        die(str(e), EXIT_TIMEOUT)
+        return_code, stdout, stderr = exec_command(
+            client,
+            vm,
+            run_command,
+            as_user=args.as_user,
+            timeout=args.timeout,
+            stream=True,
+        )
+    except TimeoutError as error:
+        _cleanup(client, vm, work_directory, keep)
+        die(str(error), EXIT_TIMEOUT)
 
-    sys.stdout.buffer.write(out)
+    sys.stdout.buffer.write(stdout)
     sys.stdout.buffer.flush()
-    if err:
-        sys.stderr.buffer.write(err)
+    if stderr:
+        sys.stderr.buffer.write(stderr)
         sys.stderr.buffer.flush()
-    _cleanup(client, vm, workdir, keep)
-    return rc
+    _cleanup(client, vm, work_directory, keep)
+    return return_code
 
 
 def _cleanup(client, vm, workdir, keep):
@@ -730,16 +948,25 @@ def _cleanup(client, vm, workdir, keep):
 # One-liner remote snapshot: "inode mtime size sha256" or "MISSING" if absent.
 _SNAP_SH = (
     'p={p}; if [ -e "$p" ]; then '
-    'i=$(stat -c %i "$p"); m=$(stat -c %Y "$p"); s=$(stat -c %s "$p"); '
-    'if [ -f "$p" ]; then h=$(sha256sum "$p" | cut -d" " -f1); else h=-; fi; '
-    'echo "$i $m $s $h"; else echo MISSING; fi'
+    'meta=$(stat -c "%i %Y %s" -- "$p") || exit $?; '
+    'if [ -f "$p" ]; then h=$(sha256sum -- "$p") || exit $?; '
+    "h=${{h%% *}}; else h=-; fi; "
+    'echo "$meta $h"; else echo MISSING; fi'
 )
 
 
 def _snapshot(client, vm, path):
-    sh = _SNAP_SH.format(p=shlex.quote(path))
-    rc, out, err = exec_command(client, vm, sh, timeout=60)
-    return out.decode(errors="replace").strip()
+    snapshot_command = _SNAP_SH.format(p=shlex.quote(path))
+    return_code, stdout, stderr = exec_command(client, vm, snapshot_command, timeout=60)
+    if return_code != 0:
+        die(
+            "snapshot failed for %s: %s"
+            % (
+                path,
+                stderr.decode(errors="replace").strip() or "remote rc=%s" % return_code,
+            )
+        )
+    return stdout.decode(errors="replace").strip()
 
 
 def cmd_snap(client, vm, args):
@@ -752,12 +979,12 @@ def cmd_verify(client, vm, args):
     baseline = (args.baseline or "").strip()
     current = _snapshot(client, vm, args.path)
 
-    base_missing = (baseline == "" or baseline == "MISSING")
-    cur_missing = (current == "MISSING")
+    baseline_missing = baseline == "" or baseline == "MISSING"
+    current_missing = current == "MISSING"
 
-    if cur_missing:
-        result = "MISSING" if base_missing else "MODIFIED"
-    elif base_missing:
+    if current_missing:
+        result = "MISSING" if baseline_missing else "MODIFIED"
+    elif baseline_missing:
         result = "CREATED"
     elif current == baseline:
         result = "UNCHANGED"
@@ -767,40 +994,68 @@ def cmd_verify(client, vm, args):
     line = result
     if args.token is not None:
         found = False
-        if not cur_missing:
-            rc, out, err = exec_command(
-                client, vm,
+        if not current_missing:
+            return_code, stdout, stderr = exec_command(
+                client,
+                vm,
                 "grep -qF -- %s %s" % (shlex.quote(args.token), shlex.quote(args.path)),
-                timeout=60)
-            found = (rc == 0)
+                timeout=60,
+            )
+            found = return_code == 0
         line += " TOKEN=%s" % ("present" if found else "absent")
     print(line)
     return 0
 
 
+def _file_exists(client, vm, path, timeout):
+    return_code, stdout, stderr = exec_command(
+        client,
+        vm,
+        "if [ -e %s ]; then echo EXISTS; else echo MISSING; fi" % shlex.quote(path),
+        timeout=timeout,
+    )
+    if return_code != 0 or stdout.strip() not in (b"EXISTS", b"MISSING"):
+        die(
+            "waitfile probe failed for %s: %s"
+            % (
+                path,
+                stderr.decode(errors="replace").strip()
+                or "invalid response (rc=%s)" % return_code,
+            )
+        )
+    return stdout.strip() == b"EXISTS"
+
+
 def cmd_waitfile(client, vm, args):
-    path = args.path
-    timeout = args.timeout
-    # A pre-existing file is stale state from an earlier run and would otherwise
-    # make waitfile silently wait for a *change* instead of creation (an easy
-    # race to lose given ~1-2s tool startup). Remove it and wait for the watched
-    # job to create it fresh, so waitfile always means "wait until it appears".
-    if _snapshot(client, vm, path) != "MISSING":
-        rc, out, err = exec_command(
-            client, vm, "rm -f -- %s" % shlex.quote(path), timeout=30)
-        if rc != 0:
-            die("waitfile: could not remove pre-existing %s: %s"
-                % (path, err.decode(errors="replace").strip()))
-        status("removed pre-existing %s; waiting for it to be recreated" % path)
-    deadline = time.time() + timeout
-    poll = 1.0
-    while True:
-        if _snapshot(client, vm, path) != "MISSING":
-            status("appeared: %s" % path)
-            return 0
-        if time.time() >= deadline:
-            die("waitfile timed out after %ss: %s" % (timeout, path), EXIT_TIMEOUT)
-        time.sleep(poll)
+    path, timeout = args.path, args.timeout
+    deadline = time.monotonic() + timeout
+
+    def remaining():
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError()
+        return budget
+
+    try:
+        if getattr(args, "remove_existing", False) and _file_exists(
+            client, vm, path, remaining()
+        ):
+            return_code, stdout, stderr = exec_command(
+                client, vm, "rm -f -- %s" % shlex.quote(path), timeout=remaining()
+            )
+            if return_code != 0:
+                die(
+                    "waitfile: could not remove pre-existing %s: %s"
+                    % (path, stderr.decode(errors="replace").strip())
+                )
+            status("removed pre-existing %s; waiting for it to be recreated" % path)
+        while True:
+            if _file_exists(client, vm, path, remaining()):
+                status("appeared: %s" % path)
+                return 0
+            time.sleep(min(1.0, remaining()))
+    except TimeoutError:
+        die("waitfile timed out after %ss: %s" % (timeout, path), EXIT_TIMEOUT)
 
 
 # --- Port verbs (guest firewall) ---------------------------------------------
@@ -811,10 +1066,15 @@ def cmd_waitfile(client, vm, args):
 # vm-port-<port>-<proto> so close/list can find them again.
 def _sudo_exec(client, vm, cmd, timeout=60):
     """Run a command as root on a Linux guest; returns (rc, stdout, stderr) as text."""
-    pw = user_password(vm, vm.get("default_user"))
-    rc, out, err = exec_command(client, vm, "sudo -S -p '' %s" % cmd,
-                                timeout=timeout, stdin_data=(pw + "\n").encode())
-    return rc, out.decode(errors="replace"), err.decode(errors="replace")
+    password = user_password(vm, vm.get("default_user"))
+    return_code, stdout, stderr = exec_command(
+        client,
+        vm,
+        "sudo -S -p '' %s" % cmd,
+        timeout=timeout,
+        stdin_data=(password + "\n").encode(),
+    )
+    return return_code, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 
 def _linux_fw(client, vm):
@@ -823,13 +1083,16 @@ def _linux_fw(client, vm):
     An inactive ufw enforces nothing, so editing it would be a silent no-op --
     and its rules would override ours the moment it came up.
     """
-    rc, out, _ = _sudo_exec(client, vm, "ufw status", timeout=30)
-    if rc == 0 and "inactive" not in out.lower():
+    return_code, stdout, _ = _sudo_exec(client, vm, "ufw status", timeout=30)
+    if return_code == 0 and "inactive" not in stdout.lower():
         return "ufw"
-    rc, _, err = _sudo_exec(client, vm, "iptables -S INPUT", timeout=30)
-    if rc == 0:
+    return_code, _, stderr = _sudo_exec(client, vm, "iptables -S INPUT", timeout=30)
+    if return_code == 0:
         return "iptables"
-    die("no usable firewall in the guest (ufw not active; iptables: %s)" % err.strip())
+    die(
+        "no usable firewall in the guest (ufw not active; iptables: %s)"
+        % stderr.strip()
+    )
 
 
 def _clean_ps_err(text):
@@ -843,19 +1106,29 @@ def _clean_ps_err(text):
         return text
     body = html.unescape("".join(re.findall(r'<S S="Error">(.*?)</S>', text, re.S)))
     body = body.replace("_x000D_", "").replace("_x000A_", "\n")
-    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    return " ".join(ln for ln in lines
-                    if not re.match(r"(At line:|\+|CategoryInfo|FullyQualified)", ln))
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    return " ".join(
+        line
+        for line in lines
+        if not re.match(r"(At line:|\+|CategoryInfo|FullyQualified)", line)
+    )
 
 
 def _win_ps(client, vm, script, timeout=60):
     """Run PowerShell in a Windows guest via -EncodedCommand (no cmd.exe quoting)."""
     full = "$ErrorActionPreference='Stop';" + script
-    enc = base64.b64encode(full.encode("utf-16-le")).decode()
-    rc, out, err = exec_command(
-        client, vm, "powershell -NoProfile -NonInteractive -EncodedCommand %s" % enc,
-        timeout=timeout)
-    return rc, out.decode(errors="replace"), _clean_ps_err(err.decode(errors="replace"))
+    encoded_script = base64.b64encode(full.encode("utf-16-le")).decode()
+    return_code, stdout, stderr = exec_command(
+        client,
+        vm,
+        "powershell -NoProfile -NonInteractive -EncodedCommand %s" % encoded_script,
+        timeout=timeout,
+    )
+    return (
+        return_code,
+        stdout.decode(errors="replace"),
+        _clean_ps_err(stderr.decode(errors="replace")),
+    )
 
 
 def _port_apply(client, vm, action, port, proto):
@@ -865,30 +1138,42 @@ def _port_apply(client, vm, action, port, proto):
         if action == "open":
             # Reuse an existing rule instead of failing on a duplicate name, and
             # force Profile Any: VMware's NAT network is classified Public.
-            script = ("$n='%s';"
-                      "if(Get-NetFirewallRule -Name $n -ErrorAction SilentlyContinue)"
-                      "{Set-NetFirewallRule -Name $n -Enabled True -Profile Any}"
-                      "else{New-NetFirewallRule -Name $n -DisplayName $n "
-                      "-Direction Inbound -Action Allow -Protocol %s -LocalPort %d "
-                      "-Profile Any|Out-Null}" % (rule, proto.upper(), port))
+            script = (
+                "$n='%s';"
+                "if(Get-NetFirewallRule -Name $n -ErrorAction SilentlyContinue)"
+                "{Set-NetFirewallRule -Name $n -Enabled True -Profile Any}"
+                "else{New-NetFirewallRule -Name $n -DisplayName $n "
+                "-Direction Inbound -Action Allow -Protocol %s -LocalPort %d "
+                "-Profile Any|Out-Null}" % (rule, proto.upper(), port)
+            )
         else:
             script = "Remove-NetFirewallRule -Name '%s'" % rule
-        rc, out, err = _win_ps(client, vm, script)
-        if rc != 0:
-            die("%s %d/%s failed: %s" % (action, port, proto, (err or out).strip()))
+        return_code, stdout, stderr = _win_ps(client, vm, script)
+        if return_code != 0:
+            die(
+                "%s %d/%s failed: %s"
+                % (action, port, proto, (stderr or stdout).strip())
+            )
         return "windows firewall"
 
-    fw = _linux_fw(client, vm)
-    if fw == "ufw":
-        cmd = "ufw %s %d/%s" % ("allow" if action == "open" else "delete allow", port, proto)
+    firewall = _linux_fw(client, vm)
+    if firewall == "ufw":
+        command = "ufw %s %d/%s" % (
+            "allow" if action == "open" else "delete allow",
+            port,
+            proto,
+        )
     else:
         # -D takes the same spec as -I, so no rule numbers or comments to track.
-        cmd = "iptables %s INPUT -p %s --dport %d -j ACCEPT" % (
-            "-I" if action == "open" else "-D", proto, port)
-    rc, out, err = _sudo_exec(client, vm, cmd)
-    if rc != 0:
-        die("%s failed: %s" % (cmd, (err or out).strip()))
-    return fw
+        command = "iptables %s INPUT -p %s --dport %d -j ACCEPT" % (
+            "-I" if action == "open" else "-D",
+            proto,
+            port,
+        )
+    return_code, stdout, stderr = _sudo_exec(client, vm, command)
+    if return_code != 0:
+        die("%s failed: %s" % (command, (stderr or stdout).strip()))
+    return firewall
 
 
 def _port_list(client, vm):
@@ -896,56 +1181,73 @@ def _port_list(client, vm):
     if guest_os(vm) == "windows":
         # Only rules `vm port open` made: the name carries the port, and listing
         # every built-in Windows allow rule would be noise, not an answer.
-        rc, out, err = _win_ps(client, vm,
-                               "Get-NetFirewallRule -Name 'vm-port-*' "
-                               "-ErrorAction SilentlyContinue|"
-                               "ForEach-Object{($_.Name -replace '^vm-port-','')"
-                               " -replace '-','/'}")
-        if rc != 0:
-            die("could not list firewall rules: %s" % (err or out).strip())
-        return "windows firewall", out.split()
+        return_code, stdout, stderr = _win_ps(
+            client,
+            vm,
+            "Get-NetFirewallRule -Name 'vm-port-*' "
+            "-ErrorAction SilentlyContinue|"
+            "ForEach-Object{($_.Name -replace '^vm-port-','')"
+            " -replace '-','/'}",
+        )
+        if return_code != 0:
+            die("could not list firewall rules: %s" % (stderr or stdout).strip())
+        return "windows firewall", stdout.split()
 
-    fw = _linux_fw(client, vm)
-    if fw == "ufw":
-        rc, out, err = _sudo_exec(client, vm, "ufw status")
+    firewall = _linux_fw(client, vm)
+    if firewall == "ufw":
+        return_code, stdout, stderr = _sudo_exec(client, vm, "ufw status")
         # "8080/tcp   ALLOW   Anywhere" -- the v6 twin reads "8080/tcp (v6) ALLOW",
         # so anchoring ALLOW to the second column dedupes it for free.
-        ports = [ln.split()[0] for ln in out.splitlines()
-                 if re.match(r"^\d+(/(tcp|udp))?\s+ALLOW\b", ln)]
+        ports = [
+            line.split()[0]
+            for line in stdout.splitlines()
+            if re.match(r"^\d+(/(tcp|udp))?\s+ALLOW\b", line)
+        ]
     else:
-        rc, out, err = _sudo_exec(client, vm, "iptables -S INPUT")
-        ports = ["%s/%s" % (m.group(2), m.group(1)) for m in
-                 re.finditer(r"-p (tcp|udp).*?--dport (\d+).*?-j ACCEPT", out)]
-    if rc != 0:
-        die("could not list firewall rules: %s" % (err or out).strip())
-    return fw, ports
+        return_code, stdout, stderr = _sudo_exec(client, vm, "iptables -S INPUT")
+        ports = [
+            "%s/%s" % (match.group(2), match.group(1))
+            for match in re.finditer(
+                r"-p (tcp|udp).*?--dport (\d+).*?-j ACCEPT", stdout
+            )
+        ]
+    if return_code != 0:
+        die("could not list firewall rules: %s" % (stderr or stdout).strip())
+    return firewall, ports
 
 
 def cmd_port(client, vm, args):
     """port open|close|list -- inbound ports in the guest's own firewall."""
     if args.portverb == "list":
-        fw, ports = _port_list(client, vm)
-        for p in ports:
-            print(p)
-        status("%d open (%s)" % (len(ports), fw))
+        firewall, ports = _port_list(client, vm)
+        for port in ports:
+            print(port)
+        status("%d open (%s)" % (len(ports), firewall))
         return 0
 
     proto = args.proto.lower()
     if not 1 <= args.port <= 65535:
         die("port must be 1-65535, got %d" % args.port)
-    fw = _port_apply(client, vm, args.portverb, args.port, proto)
-    status("%s %d/%s on %s (%s)" % (
-        "opened" if args.portverb == "open" else "closed",
-        args.port, proto, vm.get("host"), fw))
+    firewall = _port_apply(client, vm, args.portverb, args.port, proto)
+    status(
+        "%s %d/%s on %s (%s)"
+        % (
+            "opened" if args.portverb == "open" else "closed",
+            args.port,
+            proto,
+            vm.get("host"),
+            firewall,
+        )
+    )
     return 0
 
 
 # --- Host / vmrun ------------------------------------------------------------
 def vmrun_path(cfg):
-    p = cfg.get("vmrun")
-    if not p:
+    path = cfg.get("vmrun")
+    if not path:
         die("no 'vmrun' path in config")
-    return p
+    return path
 
 
 def encryption_password(vm):
@@ -956,40 +1258,52 @@ def encryption_password(vm):
     """
     if not vm:
         return ""
-    return (vm.get("encryption_password") or "").strip()
+    return vm.get("encryption_password") or ""
 
 
-def run_vmrun(cfg, vmrun_args, timeout=120, vm=None):
+def run_vmrun(cfg, vmrun_args, timeout=120, vm=None, timeout_is_error=True):
     """Invoke vmrun.exe with the given args; return (rc, stdout, stderr).
 
     When `vm` is encrypted, its password is injected via -vp so vmrun can open
     it. If vmrun reports the VM needs a password we didn't supply, fail with an
     actionable hint pointing at the config field rather than looping on it.
     """
-    exe = vmrun_path(cfg)
-    if not os.path.isfile(exe):
-        die("vmrun.exe not found: %s" % exe)
-    vp = encryption_password(vm)
-    prefix = ["-vp", vp] if vp else []
-    cmd = [exe] + prefix + vmrun_args
+    executable = vmrun_path(cfg)
+    if not os.path.isfile(executable):
+        die("vmrun.exe not found: %s" % executable)
+    vm_password = encryption_password(vm)
+    prefix = ["-vp", vm_password] if vm_password else []
+    command = [executable] + prefix + vmrun_args
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout
+        )
     except subprocess.TimeoutExpired:
-        die("vmrun timed out: %s" % " ".join(vmrun_args), EXIT_TIMEOUT)
-    except FileNotFoundError:
-        die("cannot execute vmrun: %s" % exe)
-    if "a password is required" in (p.stderr or "").lower() and not vp:
-        die("VM is encrypted (Windows 11 vTPM?) and vmrun cannot open it "
-            "without the encryption password. Add \"encryption_password\": "
-            "\"<password>\" to this VM's config block.", EXIT_ENV)
-    return p.returncode, p.stdout, p.stderr
+        message = "vmrun timed out after %ss; check VMware and guest Tools" % timeout
+        if timeout_is_error:
+            die(message, EXIT_TIMEOUT)
+        return EXIT_TIMEOUT, "", message
+    except OSError as error:
+        die("cannot execute vmrun %s: %s" % (executable, error))
+    if (
+        "a password is required"
+        in ((result.stderr or "") + (result.stdout or "")).lower()
+        and not vm_password
+    ):
+        die(
+            "VM is encrypted (Windows 11 vTPM?) and vmrun cannot open it "
+            'without the encryption password. Add "encryption_password": '
+            '"<password>" to this VM\'s config block.',
+            EXIT_ENV,
+        )
+    return result.returncode, result.stdout, result.stderr
 
 
 def vmx_path(vm):
-    p = vm.get("vmx")
-    if not p:
+    path = vm.get("vmx")
+    if not path:
         die("VM has no 'vmx' path configured")
-    return p
+    return path
 
 
 # --- VMware Tools guest operations (no SSH; used to bootstrap Windows SSH) ----
@@ -1035,8 +1349,8 @@ def _vmrun_guest(cfg, vm, op_args, timeout=180):
     user = vm.get("default_user")
     if not user:
         die("VM has no default_user for guest operations")
-    pw = user_password(vm, user)
-    args = ["-T", "ws", "-gu", user, "-gp", pw] + op_args
+    password = user_password(vm, user)
+    args = ["-T", "ws", "-gu", user, "-gp", password] + op_args
     return run_vmrun(cfg, args, timeout=timeout, vm=vm)
 
 
@@ -1058,18 +1372,29 @@ def _guest_can_launch_programs(cfg, vm, wait=12):
     vmx = vmx_path(vm)
     # Clear any stale marker (ignore "not found").
     _vmrun_guest(cfg, vm, ["deleteFileInGuest", vmx, _EXEC_PROBE_PATH], timeout=30)
-    cmd = "C:\\Windows\\System32\\cmd.exe"
-    _vmrun_guest(cfg, vm,
-                 ["runProgramInGuest", vmx, "-noWait", cmd, "/c",
-                  "echo ok> " + _EXEC_PROBE_PATH],
-                 timeout=30)
+    command = "C:\\Windows\\System32\\cmd.exe"
+    _vmrun_guest(
+        cfg,
+        vm,
+        [
+            "runProgramInGuest",
+            vmx,
+            "-noWait",
+            command,
+            "/c",
+            "echo ok> " + _EXEC_PROBE_PATH,
+        ],
+        timeout=30,
+    )
     deadline = time.time() + wait
     while time.time() < deadline:
-        rc, out, err = _vmrun_guest(
-            cfg, vm, ["fileExistsInGuest", vmx, _EXEC_PROBE_PATH], timeout=30)
-        if "the file exists" in (out or "").lower():
-            _vmrun_guest(cfg, vm,
-                         ["deleteFileInGuest", vmx, _EXEC_PROBE_PATH], timeout=30)
+        return_code, stdout, stderr = _vmrun_guest(
+            cfg, vm, ["fileExistsInGuest", vmx, _EXEC_PROBE_PATH], timeout=30
+        )
+        if "the file exists" in (stdout or "").lower():
+            _vmrun_guest(
+                cfg, vm, ["deleteFileInGuest", vmx, _EXEC_PROBE_PATH], timeout=30
+            )
             return True
         time.sleep(2)
     return False
@@ -1084,44 +1409,72 @@ def bootstrap_windows_ssh(cfg, vm):
         return False
     vmx = vmx_path(vm)
     # Tools must be up for guest ops to work at all.
-    rc, out, err = run_vmrun(cfg, ["checkToolsState", vmx], timeout=60, vm=vm)
-    state = out.strip()
+    return_code, stdout, stderr = run_vmrun(
+        cfg, ["checkToolsState", vmx], timeout=60, vm=vm
+    )
+    state = stdout.strip()
     if state != "running":
-        die("VMware Tools not running in guest (state=%s); can't bootstrap SSH" % (state or "?"))
+        die(
+            "VMware Tools not running in guest (state=%s); can't bootstrap SSH"
+            % (state or "?")
+        )
 
     # Preflight: confirm Tools can actually launch a program before we copy and
     # run the (wait-mode) setup script, which would otherwise hang for minutes.
     if not _guest_can_launch_programs(cfg, vm):
-        die("VMware Tools is up and authenticates, but cannot launch programs in "
+        die(
+            "VMware Tools is up and authenticates, but cannot launch programs in "
             "the guest (StartProgram no-ops) -- so SSH can't be bootstrapped over "
             "Tools. This is common on a freshly-created Windows VM. Fix: reboot "
             "the guest and retry; if it persists, reinstall/repair VMware Tools "
             "and reboot. Workaround: enable OpenSSH manually in the guest "
             "(Add-WindowsCapability OpenSSH.Server; Start-Service sshd) -- once "
-            "sshd is up, the SSH verbs work without Tools.", EXIT_ENV)
+            "sshd is up, the SSH verbs work without Tools.",
+            EXIT_ENV,
+        )
 
-    ps = "C:\\Windows\\Temp\\vm_setup_ssh.ps1"
-    fd, tmp = tempfile.mkstemp(suffix=".ps1")
+    guest_script_path = "C:\\Windows\\Temp\\vm_setup_ssh.ps1"
+    file_descriptor, temporary_path = tempfile.mkstemp(suffix=".ps1")
     try:
-        with os.fdopen(fd, "w", encoding="ascii", errors="replace") as f:
-            f.write(WINDOWS_SSH_SETUP_PS1)
-        rc, out, err = _vmrun_guest(cfg, vm, ["copyFileFromHostToGuest", vmx, tmp, ps], 120)
-        if rc != 0:
-            die("could not copy setup script into guest: %s" % (err or out).strip())
+        with os.fdopen(
+            file_descriptor, "w", encoding="ascii", errors="replace"
+        ) as file:
+            file.write(WINDOWS_SSH_SETUP_PS1)
+        return_code, stdout, stderr = _vmrun_guest(
+            cfg,
+            vm,
+            ["copyFileFromHostToGuest", vmx, temporary_path, guest_script_path],
+            120,
+        )
+        if return_code != 0:
+            die(
+                "could not copy setup script into guest: %s"
+                % (stderr or stdout).strip()
+            )
     finally:
         try:
-            os.unlink(tmp)
+            os.unlink(temporary_path)
         except OSError:
             pass
 
     powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
-    rc, out, err = _vmrun_guest(
-        cfg, vm,
-        ["runProgramInGuest", vmx, powershell,
-         "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", ps],
-        timeout=300)
-    if rc != 0:
-        die("OpenSSH setup script failed in guest: %s" % (err or out).strip())
+    return_code, stdout, stderr = _vmrun_guest(
+        cfg,
+        vm,
+        [
+            "runProgramInGuest",
+            vmx,
+            powershell,
+            "-ExecutionPolicy",
+            "Bypass",
+            "-NoProfile",
+            "-File",
+            guest_script_path,
+        ],
+        timeout=300,
+    )
+    if return_code != 0:
+        die("OpenSSH setup script failed in guest: %s" % (stderr or stdout).strip())
 
     host = vm.get("host")
     if host and _wait_for_ssh(vm, host, timeout=90):
@@ -1133,9 +1486,11 @@ def cmd_vm_snapshot(cfg, vm, args):
     snap = args.snap or vm.get("snapshot")
     if not snap:
         die("no snapshot name given and no 'snapshot' in config")
-    rc, out, err = run_vmrun(cfg, ["snapshot", vmx_path(vm), snap], vm=vm)
-    if rc != 0:
-        die("vmrun snapshot failed: %s" % (err or out).strip(), rc or 1)
+    return_code, stdout, stderr = run_vmrun(
+        cfg, ["snapshot", vmx_path(vm), snap], vm=vm
+    )
+    if return_code != 0:
+        die("vmrun snapshot failed: %s" % (stderr or stdout).strip(), return_code or 1)
     status("snapshot taken: %s" % snap)
     return 0
 
@@ -1144,60 +1499,121 @@ def cmd_vm_revert(cfg, vm, args):
     snap = args.snap or vm.get("snapshot")
     if not snap:
         die("no snapshot name given and no 'snapshot' in config")
-    rc, out, err = run_vmrun(cfg, ["revertToSnapshot", vmx_path(vm), snap], vm=vm)
-    if rc != 0:
-        die("vmrun revert failed: %s" % (err or out).strip(), rc or 1)
+    return_code, stdout, stderr = run_vmrun(
+        cfg, ["revertToSnapshot", vmx_path(vm), snap], vm=vm
+    )
+    if return_code != 0:
+        die("vmrun revert failed: %s" % (stderr or stdout).strip(), return_code or 1)
     status("reverted to snapshot: %s" % snap)
     return 0
 
 
+def _vm_running(cfg, vm, timeout=30):
+    return_code, stdout, stderr = run_vmrun(cfg, ["list"], timeout=timeout)
+    if return_code != 0:
+        die("vmrun list failed: %s" % (stderr or stdout).strip(), return_code)
+
+    def normalized_path(path):
+        return os.path.normcase(os.path.abspath(path.strip()))
+
+    target_path = normalized_path(vmx_path(vm))
+    for line in stdout.splitlines():
+        if line.strip().lower().endswith(".vmx"):
+            if normalized_path(line) == target_path:
+                return True
+    return False
+
+
 def cmd_vm_start(cfg, vm, args):
-    rc, out, err = run_vmrun(cfg, ["start", vmx_path(vm), "nogui"], vm=vm)
-    if rc != 0:
-        die("vmrun start failed: %s" % (err or out).strip(), rc or 1)
-    status("started")
+    if not _vm_running(cfg, vm):
+        return_code, stdout, stderr = run_vmrun(
+            cfg, ["start", vmx_path(vm), "nogui"], vm=vm
+        )
+        if return_code != 0:
+            die("vmrun start failed: %s" % (stderr or stdout).strip(), return_code)
+    if getattr(args, "no_wait", False):
+        status("powered on")
+        return 0
+    deadline = time.monotonic() + getattr(args, "timeout", 180)
+    ip = _get_ip(cfg, vm, retries=1000, timeout=max(0, deadline - time.monotonic()))
+    if not ip:
+        die("start timed out waiting for guest IP (VMware Tools?)", EXIT_TIMEOUT)
+    vm["host"] = ip
+    if not _wait_for_ssh(vm, ip, timeout=max(0, deadline - time.monotonic())):
+        die("start timed out waiting for SSH at %s" % ip, EXIT_TIMEOUT)
+    status("started; SSH ready at %s" % ip)
     return 0
 
 
 def cmd_vm_stop(cfg, vm, args):
-    rc, out, err = run_vmrun(cfg, ["stop", vmx_path(vm), "soft"], vm=vm)
-    if rc != 0:
-        # try hard stop as fallback
-        rc, out, err = run_vmrun(cfg, ["stop", vmx_path(vm), "hard"], vm=vm)
-        if rc != 0:
-            die("vmrun stop failed: %s" % (err or out).strip(), rc or 1)
-    status("stopped")
-    return 0
+    if not _vm_running(cfg, vm):
+        status("already stopped")
+        return 0
+    mode = "hard" if getattr(args, "hard", False) else "soft"
+    return_code, stdout, stderr = run_vmrun(cfg, ["stop", vmx_path(vm), mode], vm=vm)
+    if return_code != 0:
+        die(
+            "vmrun stop failed: %s; use stop --hard to force power off"
+            % (stderr or stdout).strip(),
+            return_code,
+        )
+    deadline = time.monotonic() + getattr(args, "timeout", 180)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            die(
+                "stop timed out waiting for power off; use stop --hard to force power off",
+                EXIT_TIMEOUT,
+            )
+        if not _vm_running(cfg, vm, timeout=min(3, remaining)):
+            status("stopped")
+            return 0
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
 
 
 def cmd_vm_list(cfg, vm, args):
-    rc, out, err = run_vmrun(cfg, ["list"])
-    if rc != 0:
-        die("vmrun list failed: %s" % (err or out).strip(), rc or 1)
-    sys.stdout.write(out)
+    return_code, stdout, stderr = run_vmrun(cfg, ["list"])
+    if return_code != 0:
+        die("vmrun list failed: %s" % (stderr or stdout).strip(), return_code or 1)
+    sys.stdout.write(stdout)
     return 0
 
 
 def cmd_vm_snapshots(cfg, vm, args):
-    rc, out, err = run_vmrun(cfg, ["listSnapshots", vmx_path(vm)], vm=vm)
-    if rc != 0:
-        die("vmrun listSnapshots failed: %s" % (err or out).strip(), rc or 1)
-    sys.stdout.write(out)
+    return_code, stdout, stderr = run_vmrun(cfg, ["listSnapshots", vmx_path(vm)], vm=vm)
+    if return_code != 0:
+        die(
+            "vmrun listSnapshots failed: %s" % (stderr or stdout).strip(),
+            return_code or 1,
+        )
+    sys.stdout.write(stdout)
     return 0
 
 
-def _get_ip(cfg, vm, retries=30, delay=2):
-    """getGuestIPAddress with a retry loop (Tools not up immediately after boot)."""
-    last = ""
-    for _ in range(retries):
-        rc, out, err = run_vmrun(cfg, ["getGuestIPAddress", vmx_path(vm), "-wait"],
-                                 timeout=60, vm=vm)
-        ip = out.strip()
-        if rc == 0 and ip and ip[0].isdigit():
-            return ip
-        last = (err or out).strip()
-        time.sleep(delay)
-    return None if not last else None
+def _get_ip(cfg, vm, retries=30, delay=2, timeout=60):
+    """Poll Tools within one total budget, accepting valid IPv4 or IPv6 only."""
+    deadline = time.monotonic() + timeout
+    for attempt in range(retries):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        return_code, stdout, stderr = run_vmrun(
+            cfg,
+            ["getGuestIPAddress", vmx_path(vm)],
+            timeout=min(3, remaining),
+            vm=vm,
+            timeout_is_error=False,
+        )
+        if return_code == 0:
+            try:
+                return str(ipaddress.ip_address(stdout.strip()))
+            except ValueError:
+                pass
+        if "not powered on" in (stdout + stderr).lower():
+            break
+        if attempt + 1 < retries:
+            time.sleep(min(delay, max(0, deadline - time.monotonic())))
+    return None
 
 
 def cmd_vm_ip(cfg, vm, vm_name, args, config_path):
@@ -1214,25 +1630,24 @@ def cmd_vm_ip(cfg, vm, vm_name, args, config_path):
 
 def _wait_for_ssh(vm, host, timeout=180):
     """Poll SSH until it accepts a connection or timeout."""
-    user = vm.get("default_user")
-    password = user_password(vm, user)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    target = dict(vm, host=host)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
         try:
-            client.connect(hostname=host, username=user, password=password,
-                           timeout=CONNECT_TIMEOUT, banner_timeout=CONNECT_TIMEOUT,
-                           auth_timeout=CONNECT_TIMEOUT, look_for_keys=False,
-                           allow_agent=False)
+            client = _ssh_open(target, timeout=min(CONNECT_TIMEOUT, remaining / 3))
             client.close()
             return True
+        except (
+            paramiko.AuthenticationException,
+            ValueError,
+            paramiko.BadHostKeyException,
+        ) as error:
+            die(
+                "SSH readiness check failed: %s; check guest credentials/config" % error
+            )
         except Exception:
-            try:
-                client.close()
-            except Exception:
-                pass
-            time.sleep(3)
+            time.sleep(min(3, max(0, deadline - time.monotonic())))
     return False
 
 
@@ -1240,13 +1655,13 @@ def cmd_vm_reset(cfg, vm, vm_name, args, config_path):
     snap = vm.get("snapshot")
     if not snap:
         die("no 'snapshot' configured for reset")
-    rc, out, err = run_vmrun(cfg, ["revertToSnapshot", vmx_path(vm), snap], vm=vm)
-    if rc != 0:
-        die("revert failed: %s" % (err or out).strip(), rc or 1)
+    return_code, stdout, stderr = run_vmrun(
+        cfg, ["revertToSnapshot", vmx_path(vm), snap], vm=vm
+    )
+    if return_code != 0:
+        die("revert failed: %s" % (stderr or stdout).strip(), return_code or 1)
     status("reverted to %s" % snap)
-    rc, out, err = run_vmrun(cfg, ["start", vmx_path(vm), "nogui"], vm=vm)
-    if rc != 0:
-        die("start failed: %s" % (err or out).strip(), rc or 1)
+    cmd_vm_start(cfg, vm, argparse.Namespace(no_wait=True))
     status("powered on; discovering IP...")
     ip = _get_ip(cfg, vm)
     if not ip:
@@ -1267,45 +1682,49 @@ def cmd_vm_reset(cfg, vm, vm_name, args, config_path):
 def cmd_vm_setup_ssh(cfg, vm, vm_name, args):
     """Enable OpenSSH in the guest so the SSH verbs work. Windows-only; idempotent."""
     if guest_os(vm) != "windows":
-        status("%s is a %s guest; SSH is native - nothing to set up" %
-               (vm_name, guest_os(vm)))
+        status(
+            "%s is a %s guest; SSH is native - nothing to set up"
+            % (vm_name, guest_os(vm))
+        )
         return 0
     if not vm.get("host"):
-        die("VM has no host/IP configured (run: python vm.py --vm %s vm ip --save)" % vm_name)
+        die("VM has no host/IP configured (run: vm --vm %s ip --save)" % vm_name)
     if bootstrap_windows_ssh(cfg, vm):
-        status("OpenSSH is up on %s (%s); SSH verbs are ready" % (vm_name, vm.get("host")))
+        status(
+            "OpenSSH is up on %s (%s); SSH verbs are ready" % (vm_name, vm.get("host"))
+        )
         return 0
     die("bootstrap ran but SSH did not come up on %s" % vm.get("host"), EXIT_ENV)
 
 
 # --- Provisioning: stage a host folder of tools into the guest ---------------
 # Convention over config: drop files in provision/<vm-name>/ (or provision/<os>/)
-# next to vm.py. On first connect they're synced to the guest tools dir and made
+# beside the config. On first connect they're synced to the guest tools dir and made
 # executable; an optional setup.sh (Linux) / setup.ps1 (Windows, run elevated over
 # VMware Tools) does anything a plain copy can't. A hash marker skips unchanged runs.
 def provision_local_dir(vm, vm_name):
     """Host folder to stage, or None. Prefers provision/<vm-name>/, then provision/<os>/.
     Anchored to PROJECT_DIR (the config's directory), so it works when installed."""
     base = os.path.join(PROJECT_DIR, "provision")
-    for cand in (vm_name, guest_os(vm)):
-        d = os.path.join(base, cand)
-        if os.path.isdir(d):
-            return d
+    for folder_name in (vm_name, guest_os(vm)):
+        directory = os.path.join(base, folder_name)
+        if os.path.isdir(directory):
+            return directory
     return None
 
 
 def _tree_hash(localdir):
     """Stable hash of a folder's relative paths + contents (order-independent)."""
-    h = hashlib.sha256()
+    tree_hash = hashlib.sha256()
     for root, dirs, names in os.walk(localdir):
         dirs.sort()
-        for n in sorted(names):
-            p = os.path.join(root, n)
-            rel = os.path.relpath(p, localdir).replace(os.sep, "/")
-            h.update(rel.encode())
-            with open(p, "rb") as f:
-                h.update(hashlib.sha256(f.read()).digest())
-    return h.hexdigest()
+        for filename in sorted(names):
+            file_path = os.path.join(root, filename)
+            relative_path = os.path.relpath(file_path, localdir).replace(os.sep, "/")
+            tree_hash.update(relative_path.encode())
+            with open(file_path, "rb") as file:
+                tree_hash.update(hashlib.sha256(file.read()).digest())
+    return tree_hash.hexdigest()
 
 
 def _run_setup_script(cfg, vm, client, tools, localdir):
@@ -1317,78 +1736,100 @@ def _run_setup_script(cfg, vm, client, tools, localdir):
         winpath = (posixpath.join(tools, "setup.ps1")).replace("/", "\\")
         powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
         status("running setup.ps1 (elevated, via VMware Tools)...")
-        rc, out, err = _vmrun_guest(
-            cfg, vm, ["runProgramInGuest", vmx_path(vm), powershell,
-                      "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", winpath],
-            timeout=1800)
-        if rc != 0:
-            die("setup.ps1 failed in guest: %s" % (err or out).strip(), rc or 1)
+        return_code, stdout, stderr = _vmrun_guest(
+            cfg,
+            vm,
+            [
+                "runProgramInGuest",
+                vmx_path(vm),
+                powershell,
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NoProfile",
+                "-File",
+                winpath,
+            ],
+            timeout=1800,
+        )
+        if return_code != 0:
+            die(
+                "setup.ps1 failed in guest: %s" % (stderr or stdout).strip(),
+                return_code or 1,
+            )
     else:
         if not os.path.isfile(os.path.join(localdir, "setup.sh")):
             return
         status("running setup.sh...")
-        rc, out, err = exec_command(
-            client, vm, "bash %s" % shlex.quote(posixpath.join(tools, "setup.sh")),
-            timeout=1800)
-        if err:
-            sys.stderr.buffer.write(err)
+        return_code, stdout, stderr = exec_command(
+            client,
+            vm,
+            "bash %s" % shlex.quote(posixpath.join(tools, "setup.sh")),
+            timeout=1800,
+        )
+        if stderr:
+            sys.stderr.buffer.write(stderr)
             sys.stderr.buffer.flush()
-        if rc != 0:
-            die("setup.sh failed (rc=%d)" % rc, rc or 1)
+        if return_code != 0:
+            die("setup.sh failed (rc=%d)" % return_code, return_code or 1)
 
 
 def provision_guest(cfg, vm, vm_name, client, force=False, verbose=True):
     """Ensure provision/<vm|os>/ is staged into the guest tools dir. Returns True
     if it did work, False if nothing to do / already current. Idempotent."""
-    localdir = provision_local_dir(vm, vm_name)
-    if not localdir:
+    local_directory = provision_local_dir(vm, vm_name)
+    if not local_directory:
         return False
     tools = tools_remote(vm)
     marker = posixpath.join(tools, ".provisioned")
-    want = _tree_hash(localdir)
+    desired_hash = _tree_hash(local_directory)
 
     sftp = _sftp_or_none(client)
     if sftp is None:
         die("provisioning needs SFTP but it is unavailable")
     try:
-        have = None
+        current_hash = None
         try:
-            with sftp.open(marker, "r") as f:
-                have = f.read().decode(errors="replace").strip()
+            with sftp.open(marker, "r") as file:
+                current_hash = file.read().decode(errors="replace").strip()
         except IOError:
-            have = None
-        if have == want and not force:
+            current_hash = None
+        if current_hash == desired_hash and not force:
             if verbose:
-                status("tools already current (%s)" % os.path.basename(localdir))
+                status("tools already current (%s)" % os.path.basename(local_directory))
             return False
 
         _ensure_remote_dir(client, vm, sftp, tools)
         files = []
-        for root, dirs, names in os.walk(localdir):
+        for root, dirs, names in os.walk(local_directory):
             dirs.sort()
-            for n in sorted(names):
-                files.append(os.path.join(root, n))
-        made = set()
-        for lf in files:
-            rel = os.path.relpath(lf, localdir).replace(os.sep, "/")
-            rf = posixpath.join(tools, rel)
-            parent = posixpath.dirname(rf)
-            if parent and parent not in made:
+            for filename in sorted(names):
+                files.append(os.path.join(root, filename))
+        created_directories = set()
+        for local_file in files:
+            relative_path = os.path.relpath(local_file, local_directory).replace(
+                os.sep, "/"
+            )
+            remote_file = posixpath.join(tools, relative_path)
+            parent = posixpath.dirname(remote_file)
+            if parent and parent not in created_directories:
                 _ensure_remote_dir(client, vm, sftp, parent)
-                made.add(parent)
-            sftp.put(lf, rf)
+                created_directories.add(parent)
+            sftp.put(local_file, remote_file)
         status("staged %d file(s) -> %s" % (len(files), tools))
 
         if guest_os(vm) != "windows":
-            exec_command(client, vm,
-                         "find %s -type f -exec chmod +x {} +" % shlex.quote(tools),
-                         timeout=60)
+            exec_command(
+                client,
+                vm,
+                "find %s -type f -exec chmod +x {} +" % shlex.quote(tools),
+                timeout=60,
+            )
 
-        _run_setup_script(cfg, vm, client, tools, localdir)
+        _run_setup_script(cfg, vm, client, tools, local_directory)
 
-        with sftp.open(marker, "w") as f:
-            f.write(want)
-        status("provisioned %s from %s" % (vm_name, os.path.basename(localdir)))
+        with sftp.open(marker, "w") as file:
+            file.write(desired_hash)
+        status("provisioned %s from %s" % (vm_name, os.path.basename(local_directory)))
         return True
     finally:
         try:
@@ -1407,17 +1848,19 @@ def maybe_auto_provision(cfg, vm, vm_name, client):
         provision_guest(cfg, vm, vm_name, client, force=False, verbose=False)
     except SystemExit:
         raise
-    except Exception as e:
-        status("warning: auto-provision skipped: %s" % e)
+    except Exception as error:
+        status("warning: auto-provision skipped: %s" % error)
 
 
 def cmd_vm_provision(cfg, vm, vm_name, args):
     if provision_local_dir(vm, vm_name) is None:
-        die("no provision folder: create provision/%s/ or provision/%s/ next to vm.py"
-            % (vm_name, guest_os(vm)))
+        die(
+            "no provision folder: create provision/%s/ or provision/%s/ beside vmconfig.json"
+            % (vm_name, guest_os(vm))
+        )
     client = ssh_connect(cfg, vm)
     try:
-        changed = provision_guest(cfg, vm, vm_name, client, force=args.force, verbose=True)
+        provision_guest(cfg, vm, vm_name, client, force=args.force, verbose=True)
     finally:
         try:
             client.close()
@@ -1432,17 +1875,17 @@ def _probe_user_sudo(vm, uname):
     True = the user can sudo (correct password accepted by sudo -S).
     Raises on SSH/login failure (can't tell either way).
     """
-    pw = user_password(vm, uname)
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    password = user_password(vm, uname)
+    client = _ssh_open(vm, user=uname)
     try:
-        client.connect(hostname=vm.get("host"), username=uname, password=pw,
-                       timeout=CONNECT_TIMEOUT, banner_timeout=CONNECT_TIMEOUT,
-                       auth_timeout=CONNECT_TIMEOUT, look_for_keys=False,
-                       allow_agent=False)
-        rc, out, err = exec_command(client, vm, "sudo -S -p '' true",
-                                    timeout=30, stdin_data=(pw + "\n").encode())
-        return rc == 0
+        return_code, stdout, stderr = exec_command(
+            client,
+            vm,
+            "sudo -S -p '' true",
+            timeout=30,
+            stdin_data=(password + "\n").encode(),
+        )
+        return return_code == 0
     finally:
         try:
             client.close()
@@ -1457,13 +1900,40 @@ def cmd_vm_doctor(cfg, vm, vm_name, args, config_path):
     # config already parsed to get here
     checks.append(("config parses", True, config_path))
 
-    exe = cfg.get("vmrun")
-    ok_exe = bool(exe) and os.path.isfile(exe)
-    checks.append(("vmrun.exe exists", ok_exe, exe or "(unset)"))
+    executable = cfg.get("vmrun")
+    executable_exists = bool(executable) and os.path.isfile(executable)
+    checks.append(("vmrun.exe exists", executable_exists, executable or "(unset)"))
 
     vmx = vm.get("vmx")
-    ok_vmx = bool(vmx) and os.path.isfile(vmx)
-    checks.append(("vmx exists", ok_vmx, vmx or "(unset)"))
+    vmx_exists = bool(vmx) and os.path.isfile(vmx)
+    checks.append(("vmx exists", vmx_exists, vmx or "(unset)"))
+
+    # Discover the current address before SSH, using the same lookup as `vm ip`.
+    # Save changed addresses so subsequent commands can connect directly.
+    if executable_exists and vmx_exists:
+        configured_host = vm.get("host")
+        discovered_ip = _get_ip(cfg, vm)
+        if discovered_ip:
+            ip_detail = discovered_ip
+            if discovered_ip != configured_host:
+                vm["host"] = discovered_ip
+                cfg["vms"][vm_name]["host"] = discovered_ip
+                atomic_write_json(config_path, cfg)
+                ip_detail += " (was: %s; saved to %s)" % (
+                    configured_host or "unset",
+                    config_path,
+                )
+            checks.append(("guest IP", True, ip_detail))
+        else:
+            checks.append(
+                (
+                    "guest IP",
+                    False,
+                    "could not determine IP (VM powered on; Tools running?)",
+                )
+            )
+    else:
+        checks.append(("guest IP", False, "requires valid vmrun and vmx paths"))
 
     # SSH connect
     ssh_ok = False
@@ -1472,19 +1942,18 @@ def cmd_vm_doctor(cfg, vm, vm_name, args, config_path):
     try:
         host = vm.get("host")
         user = vm.get("default_user")
-        password = user_password(vm, user) if user else ""
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=host, username=user, password=password,
-                       timeout=CONNECT_TIMEOUT, banner_timeout=CONNECT_TIMEOUT,
-                       auth_timeout=CONNECT_TIMEOUT, look_for_keys=False,
-                       allow_agent=False)
+        client = _ssh_open(vm)
         ssh_ok = True
         ssh_detail = "%s@%s" % (user, host)
-    except Exception as e:
-        ssh_detail = str(e)
-        if guest_os(vm) == "windows":
-            ssh_detail += "  (run: python vm.py --vm %s vm setup-ssh)" % vm_name
+    except Exception as error:
+        ssh_detail = str(error)
+        if (
+            executable_exists
+            and vmx_exists
+            and not isinstance(error, (paramiko.AuthenticationException, ValueError))
+        ):
+            if guest_os(vm) == "windows":
+                ssh_detail += " (run: vm --vm %s setup-ssh)" % vm_name
     checks.append(("ssh connects", ssh_ok, ssh_detail))
 
     users = vm.get("users") or {}
@@ -1492,46 +1961,60 @@ def cmd_vm_doctor(cfg, vm, vm_name, args, config_path):
         # Windows guests have no sudo/`--as`; just confirm SSH command execution works.
         if ssh_ok:
             try:
-                rc, out, err = exec_command(client, vm, "whoami", timeout=30)
-                got = out.decode(errors="replace").strip()
-                checks.append(("ssh exec works", rc == 0 and bool(got),
-                               got or "rc=%d" % rc))
-            except Exception as e:
-                checks.append(("ssh exec works", False, str(e)))
+                return_code, stdout, stderr = exec_command(
+                    client, vm, "whoami", timeout=30
+                )
+                reported_username = stdout.decode(errors="replace").strip()
+                checks.append(
+                    (
+                        "ssh exec works",
+                        return_code == 0 and bool(reported_username),
+                        reported_username or "rc=%d" % return_code,
+                    )
+                )
+            except Exception as error:
+                checks.append(("ssh exec works", False, str(error)))
         else:
             checks.append(("ssh exec works", False, "ssh down"))
     elif ssh_ok:
         # per configured user: (a) `--as USER` impersonation works from default_user,
         # (b) the user's own sudo rights match the config's `sudo` flag
-        for uname in sorted(users):
+        for username in sorted(users):
             try:
-                rc, out, err = exec_command(client, vm, "id -un", as_user=uname,
-                                            timeout=30)
-                got = out.decode(errors="replace").strip()
-                ok = (rc == 0 and got == uname)
-                detail = got if got else (err.decode(errors="replace").strip() or "rc=%d" % rc)
-            except Exception as e:
+                return_code, stdout, stderr = exec_command(
+                    client, vm, "id -un", as_user=username, timeout=30
+                )
+                reported_username = stdout.decode(errors="replace").strip()
+                ok = return_code == 0 and reported_username == username
+                detail = (
+                    reported_username
+                    if reported_username
+                    else (
+                        stderr.decode(errors="replace").strip() or "rc=%d" % return_code
+                    )
+                )
+            except Exception as error:
                 ok = False
-                detail = str(e)
-            checks.append(("--as %s works" % uname, ok, detail))
+                detail = str(error)
+            checks.append(("--as %s works" % username, ok, detail))
 
-            if "sudo" in users[uname]:
-                expect = bool(users[uname]["sudo"])
+            if "sudo" in users[username]:
+                expects_sudo = bool(users[username]["sudo"])
                 try:
-                    has = _probe_user_sudo(vm, uname)
-                    ok = (has == expect)
-                    detail = ("has sudo" if has else "no sudo")
+                    has_sudo = _probe_user_sudo(vm, username)
+                    ok = has_sudo == expects_sudo
+                    detail = "has sudo" if has_sudo else "no sudo"
                     if not ok:
-                        detail += " but config says sudo=%s" % str(expect).lower()
-                except Exception as e:
+                        detail += " but config says sudo=%s" % str(expects_sudo).lower()
+                except Exception as error:
                     ok = False
-                    detail = "probe failed: %s" % e
-                checks.append(("sudo as %s" % uname, ok, detail))
+                    detail = "probe failed: %s" % error
+                checks.append(("sudo as %s" % username, ok, detail))
     else:
-        for uname in sorted(users):
-            checks.append(("--as %s works" % uname, False, "ssh down"))
-            if "sudo" in users[uname]:
-                checks.append(("sudo as %s" % uname, False, "ssh down"))
+        for username in sorted(users):
+            checks.append(("--as %s works" % username, False, "ssh down"))
+            if "sudo" in users[username]:
+                checks.append(("sudo as %s" % username, False, "ssh down"))
 
     if client is not None:
         try:
@@ -1555,19 +2038,18 @@ def default_wsl_distro():
     Parses `wsl -l -v` (UTF-16 encoded on Windows); the default distro is the
     row flagged with a leading `*`."""
     try:
-        p = subprocess.run(["wsl", "-l", "-v"],
-                           capture_output=True, timeout=15)
+        result = subprocess.run(["wsl", "-l", "-v"], capture_output=True, timeout=15)
     except Exception:
         return None
-    if p.returncode != 0:
+    if result.returncode != 0:
         return None
     # wsl.exe emits UTF-16LE; decode leniently and strip NULs either way.
     try:
-        out = p.stdout.decode("utf-16-le")
+        stdout = result.stdout.decode("utf-16-le")
     except (UnicodeDecodeError, LookupError):
-        out = p.stdout.decode("utf-8", "ignore")
-    out = out.replace("\x00", "")
-    for line in out.splitlines():
+        stdout = result.stdout.decode("utf-8", "ignore")
+    stdout = stdout.replace("\x00", "")
+    for line in stdout.splitlines():
         line = line.rstrip()
         if line.lstrip().startswith("*"):
             # e.g. "* Ubuntu-24.04    Running    2"
@@ -1585,15 +2067,19 @@ def wsl_mount_point(vm):
 def cmd_mount(cfg, vm, args):
     distro = vm.get("wsl_distro") or default_wsl_distro()
     if not distro:
-        die("no wsl_distro configured and no default WSL distro found "
-            "(is WSL installed? `wsl -l -v`)")
+        die(
+            "no wsl_distro configured and no default WSL distro found "
+            "(is WSL installed? `wsl -l -v`)"
+        )
     host = vm.get("host")
     user = vm.get("default_user")
     password = user_password(vm, user)
     remote = vm.get("staging_remote")
-    local = vm.get("staging_local")
-    if not remote or not local:
-        die("staging_remote and staging_local must be set for mount")
+    if not remote:
+        die("staging_remote must be set for mount")
+    # Keep the mount path stable for umount, even when SSH recovers a stale IP
+    # for this invocation without saving it to config.
+    mount_point = wsl_mount_point(vm)
     # sshfs cannot create the remote directory; if staging_remote doesn't exist
     # yet (e.g. before the first push/sync) the mount fails with a confusing
     # "No such file or directory". Ensure it exists first.
@@ -1610,150 +2096,329 @@ def cmd_mount(cfg, vm, args):
             client.close()
         except Exception:
             pass
-    mnt = wsl_mount_point(vm)
+    host = vm.get("host")
     # $HOME is left unquoted so bash expands it; the rest is quoted.
-    sshfs = ("mkdir -p %s && echo %s | sshfs -o password_stdin,"
-             "StrictHostKeyChecking=no,reconnect %s@%s:%s %s" % (
-                 mnt, shlex.quote(password),
-                 shlex.quote(user), shlex.quote(host),
-                 shlex.quote(remote), mnt))
+    sshfs = (
+        "mkdir -p %s && sshfs -o password_stdin,"
+        "StrictHostKeyChecking=no,reconnect -p %d %s@%s:%s %s"
+        % (
+            mount_point,
+            vm.get("ssh_port", 22),
+            shlex.quote(user),
+            shlex.quote(host),
+            shlex.quote(remote),
+            mount_point,
+        )
+    )
     try:
-        p = subprocess.run(["wsl", "-d", distro, "bash", "-c", sshfs],
-                           capture_output=True, text=True, timeout=60)
-    except Exception as e:
-        die("wsl mount failed: %s" % e)
-    if p.returncode != 0:
-        die("sshfs mount failed: %s" % (p.stderr or p.stdout).strip())
-    status("mounted %s:%s at %s (wsl %s)" % (host, remote, mnt, distro))
+        result = subprocess.run(
+            ["wsl", "-d", distro, "bash", "-c", sshfs],
+            input=password + "\n",
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        die("wsl mount timed out after 60s", EXIT_TIMEOUT)
+    except OSError as error:
+        die("wsl mount failed: %s" % error)
+    if result.returncode != 0:
+        die("sshfs mount failed: %s" % (result.stderr or result.stdout).strip())
+    status("mounted %s:%s at %s (wsl %s)" % (host, remote, mount_point, distro))
     return 0
 
 
 def cmd_umount(cfg, vm, args):
     distro = vm.get("wsl_distro") or default_wsl_distro()
     if not distro:
-        die("no wsl_distro configured and no default WSL distro found "
-            "(is WSL installed? `wsl -l -v`)")
-    mnt = wsl_mount_point(vm)
+        die(
+            "no wsl_distro configured and no default WSL distro found "
+            "(is WSL installed? `wsl -l -v`)"
+        )
+    mount_point = wsl_mount_point(vm)
     try:
-        p = subprocess.run(["wsl", "-d", distro, "bash", "-c",
-                            "fusermount -u %s" % mnt],
-                           capture_output=True, text=True, timeout=60)
-    except Exception as e:
-        die("wsl umount failed: %s" % e)
-    if p.returncode != 0:
-        die("umount failed: %s" % (p.stderr or p.stdout).strip())
-    status("unmounted %s" % mnt)
+        result = subprocess.run(
+            ["wsl", "-d", distro, "bash", "-c", "fusermount -u %s" % mount_point],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as error:
+        die("wsl umount failed: %s" % error)
+    if result.returncode != 0:
+        die("umount failed: %s" % (result.stderr or result.stdout).strip())
+    status("unmounted %s" % mount_point)
     return 0
 
 
 # --- Argument parsing --------------------------------------------------------
+class CLIParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        die(message)
+
+
+def _positive_int(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _port_number(value):
+    number = int(value)
+    if not 1 <= number <= 65535:
+        raise argparse.ArgumentTypeError("port must be in 1-65535")
+    return number
+
+
+def _common_options(parser, root=False):
+    # Suppressed child defaults preserve values supplied before the command.
+    default = None if root else argparse.SUPPRESS
+    parser.add_argument(
+        "--vm", default=default, help="named VM (default: config default_vm)"
+    )
+    parser.add_argument(
+        "--config",
+        default=default,
+        help="config path (else VM_CONFIG, nearest parent config, then home)",
+    )
+    parser.add_argument(
+        "--no-provision",
+        action="store_true",
+        default=False if root else argparse.SUPPRESS,
+        help="skip automatic tool staging/setup for guest commands",
+    )
+
+
+def _command(subparsers, name, **kwargs):
+    parser = subparsers.add_parser(name, **kwargs)
+    _common_options(parser)
+    return parser
+
+
+def _host_commands(subparsers):
+    for name, help_text in (
+        ("snapshot", "take a snapshot (default: config snapshot)"),
+        ("revert", "revert to a snapshot (default: config snapshot)"),
+        ("reset", "revert to clean snapshot, boot, refresh IP and wait for SSH"),
+        ("start", "power on"),
+        ("stop", "power off"),
+        ("list", "list running VMs (no VM selection needed)"),
+        ("snapshots", "list this VM's snapshots"),
+        ("ip", "discover guest IP"),
+        ("doctor", "check config, VMware paths, SSH and sudo"),
+        ("setup-ssh", "(Windows) enable OpenSSH over VMware Tools"),
+        ("provision", "stage provision/<vm|os>/ into the guest tools dir"),
+    ):
+        parser = _command(subparsers, name, help=help_text)
+        if name in {"snapshot", "revert"}:
+            parser.add_argument("snap", nargs="?")
+        elif name in {"start", "stop"}:
+            parser.add_argument(
+                "--timeout",
+                type=_positive_int,
+                default=180,
+                help="readiness/power-off wait timeout (s)",
+            )
+            if name == "start":
+                parser.add_argument(
+                    "--no-wait",
+                    action="store_true",
+                    help="return after power on without waiting for SSH",
+                )
+            else:
+                parser.add_argument(
+                    "--hard",
+                    action="store_true",
+                    help="force power off instead of graceful shutdown",
+                )
+        elif name == "ip":
+            parser.add_argument(
+                "--save", action="store_true", help="write IP back to config"
+            )
+        elif name == "provision":
+            parser.add_argument(
+                "--force", action="store_true", help="re-stage even if unchanged"
+            )
+
+
 def build_parser():
-    p = argparse.ArgumentParser(
+    parser = CLIParser(
         prog="vm",
-        description="Generic VM automation: guest control over SSH + host control via vmrun.")
-    p.add_argument("--vm", help="named VM from config (default: config default_vm)")
-    p.add_argument("--config", help="config path (default: vmconfig.json next to vm.py, "
-                                     "or $VM_CONFIG)")
-    sub = p.add_subparsers(dest="verb", required=True)
+        description="Run commands and transfer files over SSH; manage VMware guests with vmrun.",
+        epilog='Examples: vm run "whoami" | vm doctor --vm NAME | vm ip --save',
+    )
+    _common_options(parser, root=True)
+    commands = parser.add_subparsers(dest="verb", required=True)
 
     # run
-    s = sub.add_parser("run", help="run a command on the guest over SSH")
-    s.add_argument("command", help="command string to run")
-    s.add_argument("--as", dest="as_user", metavar="USER", help="run as another user via sudo")
-    s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="command timeout (s)")
+    command_parser = _command(
+        commands, "run", help="run a command on the guest over SSH"
+    )
+    command_parser.add_argument("command", help="command string to run")
+    command_parser.add_argument(
+        "--as", dest="as_user", metavar="USER", help="run as another user via sudo"
+    )
+    command_parser.add_argument(
+        "--timeout",
+        type=_positive_int,
+        default=DEFAULT_TIMEOUT,
+        help="command timeout (s)",
+    )
 
     # push
-    s = sub.add_parser("push", help="upload files/dirs/globs (SFTP, base64 fallback)")
-    s.add_argument("paths", nargs="+", metavar="SRC... [DEST]",
-                   help="SRC may be a file, directory (recursed), or glob (docs/*.txt, "
-                        "src/**/*.py). Sources keep their relative path under the destination "
-                        "(default: staging_remote), so `push docs/*.txt` recreates docs/ remotely. "
-                        "With 2+ args a trailing path that isn't local is an explicit remote DEST; "
-                        "a single file + DEST is a literal rename.")
+    command_parser = _command(
+        commands, "push", help="upload files/dirs/globs (SFTP, base64 fallback)"
+    )
+    command_parser.add_argument(
+        "--dest",
+        metavar="REMOTE",
+        help="explicit destination; every positional path is a source",
+    )
+    command_parser.add_argument(
+        "paths",
+        nargs="+",
+        metavar="SRC... [DEST]",
+        help="SRC may be a file, directory (recursed), or glob (docs/*.txt, "
+        "src/**/*.py). Sources keep their relative path under the destination "
+        "(default: staging_remote), so `push docs/*.txt` recreates docs/ remotely. "
+        "With 2+ args a trailing path that isn't local is an explicit remote DEST; "
+        "a single file + DEST is a literal rename.",
+    )
 
     # pull
-    s = sub.add_parser("pull", help="download a file (SFTP, base64 fallback)")
-    s.add_argument("remote")
-    s.add_argument("local", nargs="?", help="local path (default: ./basename)")
+    command_parser = _command(
+        commands, "pull", help="download a file (SFTP, base64 fallback)"
+    )
+    command_parser.add_argument("remote")
+    command_parser.add_argument(
+        "local", nargs="?", help="local path (default: ./basename)"
+    )
 
     # sync
-    s = sub.add_parser("sync", help="bulk push a directory (defaults from config staging)")
-    s.add_argument("localdir", nargs="?")
-    s.add_argument("remotedir", nargs="?")
+    command_parser = _command(
+        commands, "sync", help="bulk push a directory (defaults from config staging)"
+    )
+    command_parser.add_argument("localdir", nargs="?")
+    command_parser.add_argument("remotedir", nargs="?")
 
     # build-run
-    s = sub.add_parser("build-run", help="push, compile on VM, run, stream output+rc")
-    s.add_argument("source", help="local source file (.c/.cpp compiled; .sh/.py run directly)")
-    s.add_argument("--as", dest="as_user", metavar="USER", help="run as another user via sudo")
-    s.add_argument("--args", nargs=argparse.REMAINDER, default=[],
-                   help="arguments passed to the program (must be last); a single "
-                        "quoted value is split shell-style: --args \"1 2 3\" = 3 args")
-    s.add_argument("--keep", action="store_true", help="keep the temp build dir on the VM")
-    s.add_argument("--dir", metavar="REMOTE",
-                   help="build in this remote dir (created if needed) and leave artifacts there, "
-                        "instead of a temp dir")
-    s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="build/run timeout (s)")
+    command_parser = _command(
+        commands, "build-run", help="(Linux) push, compile on VM, run, print output+rc"
+    )
+    command_parser.add_argument(
+        "source", help="local source file (.c/.cpp compiled; .sh/.py run directly)"
+    )
+    command_parser.add_argument(
+        "--as", dest="as_user", metavar="USER", help="run as another user via sudo"
+    )
+    command_parser.add_argument(
+        "--args",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="arguments passed to the program (must be last); a single "
+        'quoted value is split shell-style: --args "1 2 3" = 3 args',
+    )
+    command_parser.add_argument(
+        "--keep", action="store_true", help="keep the temp build dir on the VM"
+    )
+    command_parser.add_argument(
+        "--dir",
+        metavar="REMOTE",
+        help="build in this remote dir (created if needed) and leave artifacts there, "
+        "instead of a temp dir",
+    )
+    command_parser.add_argument(
+        "--timeout",
+        type=_positive_int,
+        default=DEFAULT_TIMEOUT,
+        help="build/run timeout (s)",
+    )
 
     # snap
-    s = sub.add_parser("snap", help="print one-line 'inode mtime size sha256' snapshot")
-    s.add_argument("path")
+    command_parser = _command(
+        commands, "snap", help="(Linux) print 'inode mtime size sha256' snapshot"
+    )
+    command_parser.add_argument("path")
 
     # verify
-    s = sub.add_parser("verify", help="compare path to a baseline snap-line")
-    s.add_argument("path")
-    s.add_argument("--baseline", required=True, help="the snap-line to compare against")
-    s.add_argument("--token", help="also report whether this token appears in file content")
+    command_parser = _command(
+        commands, "verify", help="(Linux) compare path to a baseline snap-line"
+    )
+    command_parser.add_argument("path")
+    command_parser.add_argument(
+        "--baseline", required=True, help="the snap-line to compare against"
+    )
+    command_parser.add_argument(
+        "--token", help="also report whether this token appears in file content"
+    )
 
     # waitfile
-    s = sub.add_parser("waitfile",
-                       help="block until a file appears (a pre-existing file is "
-                            "removed first, then watched for recreation)")
-    s.add_argument("path")
-    s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="max wait (s)")
+    command_parser = _command(
+        commands,
+        "waitfile",
+        help="(Linux) wait for a file; existing files satisfy the wait",
+    )
+    command_parser.add_argument("path")
+    command_parser.add_argument(
+        "--remove-existing",
+        action="store_true",
+        help="delete the existing file first, then wait for recreation",
+    )
+    command_parser.add_argument(
+        "--timeout", type=_positive_int, default=DEFAULT_TIMEOUT, help="max wait (s)"
+    )
 
     # port (guest firewall)
-    s = sub.add_parser("port", help="open/close/list inbound ports in the guest firewall")
-    psub = s.add_subparsers(dest="portverb", required=True)
-    for act, h in (("open", "allow inbound traffic to a port"),
-                   ("close", "remove the rule `port open` added")):
-        x = psub.add_parser(act, help=h)
-        x.add_argument("port", type=int)
-        x.add_argument("--proto", choices=["tcp", "udp"], default="tcp")
-    psub.add_parser("list", help="list inbound ports the guest firewall allows")
+    command_parser = _command(
+        commands, "port", help="open/close/list inbound ports in the guest firewall"
+    )
+    port_commands = command_parser.add_subparsers(dest="portverb", required=True)
+    for action, help_text in (
+        ("open", "allow inbound traffic to a port"),
+        ("close", "remove the rule `port open` added"),
+    ):
+        port_parser = _command(port_commands, action, help=help_text)
+        port_parser.add_argument("port", type=_port_number)
+        port_parser.add_argument("--proto", choices=["tcp", "udp"], default="tcp")
+    _command(port_commands, "list", help="list inbound ports the guest firewall allows")
 
     # vm (host control)
-    s = sub.add_parser("vm", help="host-side VMware control via vmrun")
-    vsub = s.add_subparsers(dest="vmverb", required=True)
-    x = vsub.add_parser("snapshot", help="take a snapshot (default: config snapshot)")
-    x.add_argument("snap", nargs="?")
-    x = vsub.add_parser("revert", help="revert to a snapshot (default: config snapshot)")
-    x.add_argument("snap", nargs="?")
-    vsub.add_parser("reset", help="revert to clean snapshot -> boot -> wait SSH -> refresh IP")
-    vsub.add_parser("start", help="power on")
-    vsub.add_parser("stop", help="power off")
-    vsub.add_parser("list", help="list running VMs")
-    vsub.add_parser("snapshots", help="list this VM's snapshots")
-    x = vsub.add_parser("ip", help="discover guest IP")
-    x.add_argument("--save", action="store_true", help="write IP back to config (atomic)")
-    vsub.add_parser("doctor", help="validate config/vmrun/vmx/SSH/sudo with PASS/FAIL report")
-    vsub.add_parser("setup-ssh", help="(Windows guest) enable OpenSSH over VMware Tools")
-    xp = vsub.add_parser("provision", help="stage provision/<vm|os>/ into the guest tools dir")
-    xp.add_argument("--force", action="store_true", help="re-stage even if unchanged")
+    _host_commands(commands)
+    command_parser = _command(
+        commands, "vm", help="compatibility spelling: vm vm <host command>"
+    )
+    host_commands = command_parser.add_subparsers(dest="vmverb", required=True)
+    _host_commands(host_commands)
 
     # mount / umount (optional WSL)
-    sub.add_parser("mount", help="(optional) sshfs live-bind staging dir via WSL")
-    sub.add_parser("umount", help="(optional) unmount the WSL sshfs bind")
+    _command(commands, "mount", help="(optional) sshfs live-bind staging dir via WSL")
+    _command(commands, "umount", help="(optional) unmount the WSL sshfs bind")
 
     # docs (no config needed)
-    s = sub.add_parser("docs", help="print the packaged README (usage reference)")
-    s.add_argument("--skill", action="store_true",
-                   help="print the vm-recovery SKILL.md instead of the README")
-    s.add_argument("--path", action="store_true",
-                   help="print the file's path instead of its contents")
-    s.add_argument("--install-skill", metavar="DIR", nargs="?", const=".",
-                   help="write SKILL.md to DIR/.claude/skills/vm-recovery/ (default: .)")
+    command_parser = _command(
+        commands, "docs", help="print the packaged README (usage reference)"
+    )
+    command_parser.add_argument(
+        "--skill",
+        action="store_true",
+        help="print the vm-recovery SKILL.md instead of the README",
+    )
+    command_parser.add_argument(
+        "--path",
+        action="store_true",
+        help="print the file's path instead of its contents",
+    )
+    command_parser.add_argument(
+        "--install-skill",
+        metavar="DIR",
+        nargs="?",
+        const=".",
+        help="write SKILL.md to DIR/.claude/skills/vm-recovery/ (default: .)",
+    )
 
-    return p
+    return parser
 
 
 CONFIG_NAME = "vmconfig.json"
@@ -1767,13 +2432,13 @@ def config_candidates():
     project; the home copy is the fallback for running outside one entirely.
     """
     paths = []
-    d = os.getcwd()
+    directory = os.getcwd()
     while True:
-        paths.append(os.path.join(d, CONFIG_NAME))
-        parent = os.path.dirname(d)
-        if parent == d:
+        paths.append(os.path.join(directory, CONFIG_NAME))
+        parent = os.path.dirname(directory)
+        if parent == directory:
             break
-        d = parent
+        directory = parent
     home = os.path.expanduser("~")
     paths.append(os.path.join(home, CONFIG_NAME))
     paths.append(os.path.join(home, "." + CONFIG_NAME))
@@ -1788,21 +2453,41 @@ def resolve_config_path(args):
     """
     if args.config:
         return args.config
-    env = os.environ.get("VM_CONFIG")
-    if env:
-        return env
+    environment_path = os.environ.get("VM_CONFIG")
+    if environment_path:
+        return environment_path
     for path in config_candidates():
         if os.path.isfile(path):
             return path
-    die("no %s found in %s, any parent directory, or %s\n"
+    die(
+        "no %s found in %s, any parent directory, or %s\n"
         "first-time setup: run `vm-init` here to create %s, "
-        "then run: vm vm doctor" % (CONFIG_NAME, os.getcwd(),
-                                    os.path.expanduser("~"), CONFIG_NAME))
+        "then run: vm doctor"
+        % (CONFIG_NAME, os.getcwd(), os.path.expanduser("~"), CONFIG_NAME)
+    )
 
 
 # Verbs that need an SSH client vs those that are host-only.
-GUEST_VERBS = {"run", "push", "pull", "sync", "build-run", "snap", "verify", "waitfile",
-               "port"}
+GUEST_HANDLERS = {
+    "run": cmd_run,
+    "push": cmd_push,
+    "pull": cmd_pull,
+    "sync": cmd_sync,
+    "build-run": cmd_build_run,
+    "snap": cmd_snap,
+    "verify": cmd_verify,
+    "waitfile": cmd_waitfile,
+    "port": cmd_port,
+}
+HOST_HANDLERS = {
+    "snapshot": cmd_vm_snapshot,
+    "revert": cmd_vm_revert,
+    "start": cmd_vm_start,
+    "stop": cmd_vm_stop,
+    "list": cmd_vm_list,
+    "snapshots": cmd_vm_snapshots,
+}
+HOST_VERBS = set(HOST_HANDLERS) | {"reset", "ip", "doctor", "setup-ssh", "provision"}
 
 
 def write_stdout_utf8(text):
@@ -1810,23 +2495,23 @@ def write_stdout_utf8(text):
 
     The docs contain non-ASCII (arrows, dashes) that a cp1252 stdout can't encode.
     """
-    buf = getattr(sys.stdout, "buffer", None)
-    if buf is None:  # stdout replaced (tests, pipes) -- best effort
+    output_buffer = getattr(sys.stdout, "buffer", None)
+    if output_buffer is None:  # stdout replaced (tests, pipes) -- best effort
         sys.stdout.write(text)
         return
     sys.stdout.flush()
-    buf.write(text.encode("utf-8"))
-    buf.flush()
+    output_buffer.write(text.encode("utf-8"))
+    output_buffer.flush()
 
 
 def cmd_docs(args):
     """Print (or install) documentation shipped inside the package."""
     if args.install_skill is not None:
         try:
-            dest = docs.install_skill(args.install_skill)
-        except (IOError, OSError) as e:
-            die("could not install skill: %s" % e)
-        status("installed %s" % dest)
+            destination = docs.install_skill(args.install_skill)
+        except (IOError, OSError) as error:
+            die("could not install skill: %s" % error)
+        status("installed %s" % destination)
         return 0
 
     name = "skill" if args.skill else "readme"
@@ -1854,66 +2539,56 @@ def main(argv=None):
 
     config_path = resolve_config_path(args)
     PROJECT_DIR = os.path.dirname(os.path.abspath(config_path))
-    cfg = load_config(config_path)
-    vm_name, vm = resolve_vm(cfg, args.vm)
-
+    config = load_config(config_path)
     verb = args.verb
+    if verb == "vm":
+        host_verb = args.vmverb
+    elif verb in HOST_VERBS:
+        host_verb = verb
+    else:
+        host_verb = None
+
+    # The running inventory belongs to VMware, not a selected guest.
+    if host_verb == "list":
+        return cmd_vm_list(config, None, args)
+    vm_name, vm = resolve_vm(config, args.vm)
 
     # Host-side vmrun verbs
-    if verb == "vm":
-        vv = args.vmverb
-        if vv == "snapshot":
-            return cmd_vm_snapshot(cfg, vm, args)
-        if vv == "revert":
-            return cmd_vm_revert(cfg, vm, args)
-        if vv == "reset":
-            return cmd_vm_reset(cfg, vm, vm_name, args, config_path)
-        if vv == "start":
-            return cmd_vm_start(cfg, vm, args)
-        if vv == "stop":
-            return cmd_vm_stop(cfg, vm, args)
-        if vv == "list":
-            return cmd_vm_list(cfg, vm, args)
-        if vv == "snapshots":
-            return cmd_vm_snapshots(cfg, vm, args)
-        if vv == "ip":
-            return cmd_vm_ip(cfg, vm, vm_name, args, config_path)
-        if vv == "doctor":
-            return cmd_vm_doctor(cfg, vm, vm_name, args, config_path)
-        if vv == "setup-ssh":
-            return cmd_vm_setup_ssh(cfg, vm, vm_name, args)
-        if vv == "provision":
-            return cmd_vm_provision(cfg, vm, vm_name, args)
-        die("unknown vm subcommand: %s" % vv)
+    if host_verb is not None:
+        if host_verb in HOST_HANDLERS:
+            return HOST_HANDLERS[host_verb](config, vm, args)
+        if host_verb == "reset":
+            return cmd_vm_reset(config, vm, vm_name, args, config_path)
+        if host_verb == "ip":
+            return cmd_vm_ip(config, vm, vm_name, args, config_path)
+        if host_verb == "doctor":
+            return cmd_vm_doctor(config, vm, vm_name, args, config_path)
+        if host_verb == "setup-ssh":
+            return cmd_vm_setup_ssh(config, vm, vm_name, args)
+        if host_verb == "provision":
+            return cmd_vm_provision(config, vm, vm_name, args)
+        die("unknown vm subcommand: %s" % host_verb)
 
     if verb == "mount":
-        return cmd_mount(cfg, vm, args)
+        return cmd_mount(config, vm, args)
     if verb == "umount":
-        return cmd_umount(cfg, vm, args)
+        return cmd_umount(config, vm, args)
 
     # Guest-side SSH verbs
-    if verb in GUEST_VERBS:
-        client = ssh_connect(cfg, vm)
-        maybe_auto_provision(cfg, vm, vm_name, client)
+    if verb in GUEST_HANDLERS:
+        if guest_os(vm) == "windows" and (
+            verb in {"build-run", "snap", "verify", "waitfile"}
+            or getattr(args, "as_user", None)
+        ):
+            die(
+                "%s%s is Linux-only"
+                % (verb, " --as" if getattr(args, "as_user", None) else "")
+            )
+        client = ssh_connect(config, vm)
         try:
-            if verb == "run":
-                return cmd_run(client, vm, args)
-            if verb == "push":
-                return cmd_push(client, vm, args)
-            if verb == "pull":
-                return cmd_pull(client, vm, args)
-            if verb == "sync":
-                return cmd_sync(client, vm, args)
-            if verb == "build-run":
-                return cmd_build_run(client, vm, args)
-            if verb == "snap":
-                return cmd_snap(client, vm, args)
-            if verb == "verify":
-                return cmd_verify(client, vm, args)
-            if verb == "waitfile":
-                return cmd_waitfile(client, vm, args)
-            if verb == "port":
-                return cmd_port(client, vm, args)
+            if not args.no_provision:
+                maybe_auto_provision(config, vm, vm_name, client)
+            return GUEST_HANDLERS[verb](client, vm, args)
         finally:
             try:
                 client.close()
@@ -1930,6 +2605,10 @@ def console_main():
     except KeyboardInterrupt:
         sys.stderr.write("interrupted\n")
         sys.exit(130)
+    except TimeoutError as error:
+        die(str(error), EXIT_TIMEOUT)
+    except (OSError, ValueError, paramiko.SSHException) as error:
+        die(str(error))
 
 
 if __name__ == "__main__":

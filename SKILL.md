@@ -13,16 +13,16 @@ Run every command from the project directory (where `vmconfig.json` lives).
 
 1. Try the cheap fix first — the guest IP may just have changed:
    ```
-   vm vm ip --save
+   vm ip --save
    vm run "true"
    ```
    If `run` exits `0`, the VM is fine. **Stop here.**
 
 2. Full reset (revert to clean snapshot + power on + wait for SSH + refresh IP):
    ```
-   vm vm reset
+   vm reset
    ```
-   Expected: a success line and exit `0`. If it fails, run `vm vm doctor`,
+   Expected: a success line and exit `0`. If it fails, run `vm doctor`,
    report which check says `[FAIL]`, and stop — do not retry in a loop.
 
 3. Re-upload your files — reset wiped guest-side state back to the snapshot:
@@ -37,6 +37,6 @@ Run every command from the project directory (where `vmconfig.json` lives).
 
 With the VM in a known-good state:
 ```
-vm vm snapshot clean
+vm snapshot clean
 ```
 (the name must match `snapshot` in `vmconfig.json`), then go back to step 2.

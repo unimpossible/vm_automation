@@ -83,12 +83,19 @@ def test_config_found_in_parent_directory(tmp_path):
 
 
 @pytest.mark.offline
-def test_no_config_anywhere_names_where_it_looked(tmp_path):
+def test_no_config_anywhere_names_where_it_looked(tmp_path, monkeypatch, capsys):
     """With nothing to find, the error names cwd and the home directory."""
     home = tmp_path / "home"
     home.mkdir()
-    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
-    rc, out, err = _run_cli_in(tmp_path, ["run", "true"], env=env, timeout=60)
-    assert rc == 125, "rc=%d stderr=%r" % (rc, err)
+    # tmp_path may be below the real project's config. Isolate the candidate
+    # list so an offline error-path test cannot accidentally touch a live VM.
+    from vm_cli import cli
+    monkeypatch.setattr(cli, "config_candidates", lambda: [str(home / "vmconfig.json")])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("VM_CONFIG", raising=False)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["run", "true"])
+    assert e.value.code == 125
+    err = capsys.readouterr().err
     assert "no vmconfig.json found" in err and "parent directory" in err, err
     assert "vm-init" in err, "error should point at first-time setup: %r" % err

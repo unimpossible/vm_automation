@@ -21,7 +21,7 @@ real message and a propagated exit code. (Package `vm-automation-cli`, import `v
 ```
 pip install .                               # installs the `vm` and `vm-init` commands
 vm-init                                     # pick your VMs; writes config + folders
-vm vm doctor                                # all checks should PASS
+vm doctor                                   # all checks should PASS
 ```
 `vm-init` finds the VMs VMware knows about, auto-detects each guest's OS and IP, prompts for
 user/password/snapshot, and writes `vmconfig.json` plus `staging/` and `provision/` here. Re-run it
@@ -34,7 +34,11 @@ searching the working directory, then each parent up to the filesystem root, the
 directory (`~/vmconfig.json` or `~/.vmconfig.json`). So `vm` works from any subdirectory of a
 project, and a home copy covers running outside one entirely. Whichever file wins also anchors
 `provision/` and `staging/`, which sit beside it. It holds passwords and is gitignored.
-`default_vm` is used when `--vm` is omitted.
+`default_vm` is used when `--vm` is omitted; a config with just one VM selects it automatically.
+`--vm` and `--config` work before or after a command: `vm doctor --vm myvm`.
+Relative `staging_local` paths resolve beside the config; explicit `sync LOCAL` paths resolve
+from your current directory. `vm-init --config PATH` creates folders beside that file;
+`vm-init --dir DIR` creates both the config and folders in DIR.
 
 To wire this into Claude Code or another coding agent, see `INSTALL.md`.
 
@@ -44,27 +48,30 @@ To wire this into Claude Code or another coding agent, see `INSTALL.md`.
 | verb | args | purpose |
 |---|---|---|
 | `run` | `"<cmd>" [--as USER] [--timeout N]` | exec cmd, print stdout/stderr, exit=remote rc |
-| `push` | `<src>... [dest]` | upload files/dirs/globs, keeping relative paths (SFTP, auto base64 fallback) |
+| `push` | `<src>... [dest] [--dest REMOTE]` | upload files/dirs/globs; `--dest` makes the destination explicit |
 | `pull` | `<remote> [local]` | download (SFTP, auto base64 fallback) |
 | `sync` | `<localdir> [remotedir]` | bulk push a staging dir |
 | `build-run` | `<local-src> [--as USER] [--dir REMOTE] [--keep] [--args ...]` | push+compile(gcc)+run source, one call |
-| `snap` | `<path>` | print baseline line `inode mtime size sha256` |
-| `verify` | `<path> --baseline "<line>" [--token STR]` | print CREATED\|MODIFIED\|UNCHANGED + token check |
-| `waitfile` | `<path> [--timeout N]` | block until file appears (pre-existing file is deleted first, then watched for recreation) |
+| `snap` | `<path>` | (Linux) print baseline line `inode mtime size sha256` |
+| `verify` | `<path> --baseline "<line>" [--token STR]` | (Linux) print CREATED\|MODIFIED\|UNCHANGED + token check |
+| `waitfile` | `<path> [--timeout N] [--remove-existing]` | (Linux) wait until file exists; deletion requires `--remove-existing` |
 | `port` | `open\|close <N> [--proto tcp\|udp]`, `list` | open/close/list inbound ports in the guest's own firewall |
 
 **Host (vmrun):**
 | verb | args | purpose |
 |---|---|---|
-| `vm snapshot` | `[SNAP]` | take snapshot (default: config's clean name) |
-| `vm revert` | `[SNAP]` | revert to snapshot |
-| `vm reset` | | revert to clean + power on + wait for SSH + refresh IP in config |
-| `vm start` / `vm stop` | | power on/off |
-| `vm list` / `vm snapshots` | | list running VMs / this VM's snapshots |
-| `vm ip` | `[--save]` | discover guest IP, optionally write to config |
-| `vm doctor` | | health check: config, vmrun, vmx, SSH; per user: `--as` works + sudo rights match config's `sudo` flag |
-| `vm setup-ssh` | | (Windows guest) enable OpenSSH Server over VMware Tools; idempotent |
-| `vm provision` | `[--force]` | stage `provision/<vm\|os>/` into the guest tools dir; run its setup script |
+| `snapshot` | `[SNAP]` | take snapshot (default: config's clean name) |
+| `revert` | `[SNAP]` | revert to snapshot |
+| `reset` | | revert to clean + power on + wait for SSH + refresh IP in config |
+| `start` / `stop` | `--timeout 180`; start: `--no-wait`; stop: `--hard` | power on and wait for SSH / gracefully shut down and wait for power off |
+| `list` / `snapshots` | | list running VMs / this VM's snapshots; `list` needs no selected VM |
+| `ip` | `[--save]` | discover guest IP, optionally write to config |
+| `doctor` | | health check: config, vmrun, vmx, current guest IP, SSH; discovers and saves changed IPs before connecting; per user: `--as` works + sudo rights match config's `sudo` flag |
+| `setup-ssh` | | (Windows guest) enable OpenSSH Server over VMware Tools; idempotent |
+| `provision` | `[--force]` | stage `provision/<vm\|os>/` into the guest tools dir; run its setup script |
+
+Use `vm doctor`, `vm ip --save`, etc. The older `vm vm doctor` / `vm vm ip --save`
+spellings remain supported.
 
 **Docs (needs no config):** `vm docs` prints this README from anywhere — it ships inside the
 package, so an agent can read it with no repo checked out. `--skill` prints the `vm-recovery`
@@ -84,6 +91,8 @@ Drop files into `provision/<vm-name>/` (or `provision/<os>/`) beside `vmconfig.j
 guest command they sync to the guest tools dir (`tools_remote`, default `<home>/tools`), are made
 executable on Linux, and that dir is prepended to `PATH` for `run` — so `provision/myvm/strace`
 makes `run "strace -V"` work. No manifest; the folder is the config. See `provision/README.md`.
+Use `--no-provision` on a guest command to skip automatic staging and setup, for example
+`vm run "whoami" --no-provision`.
 
 - **Setup hook:** an optional `setup.sh` / `setup.ps1` at the folder root runs once after the copy.
   `setup.ps1` runs **elevated** over VMware Tools — where an MSVC/Build Tools installer belongs,
@@ -122,11 +131,13 @@ Linux it reports every allow-by-port rule it can see, on Windows only the rules 
 ## Windows guests
 
 Set `"os": "windows"` on the VM block (see `mywinvm` in `vmconfig.example.json`). Windows has no
-SSH by default; `vm` enables it over VMware Tools automatically the first time an SSH verb can't
-connect (`enabling OpenSSH in the Windows guest...`), or on demand via `vm setup-ssh`. Needs VMware
+SSH by default; `vm` enables it over VMware Tools automatically when the confirmed guest IP
+refuses a connection on port 22, or on demand via `vm setup-ssh`. Authentication failures and
+timeouts report an error without running setup. Needs VMware
 Tools running and a **local admin** `default_user` (the modern.ie VMs' `IEUser` / `Passw0rd!`
 qualifies). Use forward slashes in remote paths (`C:/Users/IEUser/staging`); `run` executes in
-`cmd.exe`. `push` / `pull` / `sync` / `run` work — `build-run`, `--as`, and sudo are Linux-only.
+`cmd.exe`. `push` / `pull` / `sync` / `run` work — `build-run`, `snap`, `verify`, `waitfile`,
+`--as`, and sudo are Linux-only.
 
 ### Windows 11 (encrypted / vTPM) guests
 
@@ -158,12 +169,19 @@ Two Win11-specific gotchas `vm` now handles for you:
 
 ## Exit codes
 Remote command's rc passes through for `run` / `build-run`; `124` = timeout;
-`125` = can't connect / config error; `0` = success (other verbs).
+`125` = can't connect / config error / bad usage; `0` = success (other verbs).
+`run` and `build-run` stream both output channels as data arrives.
+
+After a network failure, SSH commands make one short VMware Tools IP lookup and retry if
+the address changed. This uses the new address for that invocation; `vm ip --save` persists
+it for later commands and avoids the initial stale-address timeout. An optional `ssh_port`
+in the VM block selects a port other than 22. IP discovery has a total 60-second budget and
+stops immediately when VMware reports the guest is powered off.
 
 ## If a command fails, do this
 | symptom | action |
 |---|---|
-| exit `125` (can't connect) | `vm vm ip --save` then retry once; still failing → `vm vm doctor` |
+| exit `125` (can't connect) | check the VM is powered on; `vm ip --save` then retry once; still failing → `vm doctor` |
 | exit `124` (timeout) | retry with a bigger `--timeout N`; if it repeats, the command is hanging — report it |
 | nonzero rc from `run`/`build-run` | that is the remote command's own exit code — read the printed stderr |
 | `vm doctor` shows a `[FAIL]` | fix that one line (config value, vmrun path, credentials); don't retry other verbs first |
@@ -182,6 +200,7 @@ vm push src/**/*.py                # recursive glob
 vm push docs                       # -> <staging>/docs/...     (whole dir, recursive)
 vm push a.txt b.txt /home/user/in  # 2+ args: trailing non-local arg is an explicit remote dir
 vm push local.txt /home/user/x.txt # single file + explicit path = literal rename
+vm push a.txt b.txt --dest /home/user/in # explicit destination; both paths must be local sources
 ```
 Absolute / drive-qualified / `..` sources fall back to their basename, so no host layout leaks into
 the destination. A non-matching glob or missing file is an error (exit 125).
@@ -194,9 +213,18 @@ The program runs **with the build dir as its cwd**. A single `--args` value is s
 (`--args "1 2 3"` = three arguments); multiple values pass through literally.
 
 ## Other behaviors worth knowing
-- **`waitfile` deletes a pre-existing target.** It means "wait until the job creates this file", so
-  a stale file from an earlier run is deleted first, then watched for recreation — start your job
-  and call waitfile in either order.
+- **`run` and `build-run` stream stdout and stderr as output arrives**, including compiler
+  output, and preserve the remote exit code. Remote programs may still buffer their own output.
+- **Power commands are idempotent.** `start` discovers the current IP in memory and waits for
+  SSH; `--no-wait` returns after power on. `stop` waits for power off and never automatically
+  forces shutdown; use `--hard` explicitly. `reset` checks the snapshot's restored power state.
+- **`waitfile` uses existence-only probes**, without reading or hashing file contents.
+  Probes and sleeps share the requested wait budget. `snap`/`verify` retain SHA-256 content
+  checking and report stat/hash failures.
+- **`waitfile` preserves existing files and succeeds immediately if the target exists.**
+  The previous behavior deleted the target and could remove output from a job that already
+  finished. Use `--remove-existing` for that behavior, and arrange deletion before starting
+  the producer so it cannot erase new output.
 - **`snap`/`verify` are stateless.** `snap` only prints a baseline line; pass it back via
   `verify <path> --baseline "<line>"`. No shared state file, so concurrent agents are safe.
 - **Git Bash / MSYS path gotcha.** An absolute POSIX **remote** path in any verb that takes one
@@ -213,5 +241,5 @@ vm build-run ./test.c --args "1 2 3"
 vm build-run ./test.c --dir /home/user/build    # leaves source + binary there
 vm push ./out.bin /tmp/out.bin && vm run "wc -c /tmp/out.bin"
 vm push ./a.c ./b.c /home/user/src/             # multiple files in one call
-vm vm reset
+vm reset
 ```

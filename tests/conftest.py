@@ -159,6 +159,8 @@ def bad_host_config(tmp_path):
             }
         }
     cfg["vms"][VM_NAME]["host"] = "10.255.255.1"  # unroutable -> fast TCP failure
+    # Deliberately disable VMware IP recovery in this failure fixture.
+    cfg["vms"][VM_NAME].pop("vmx", None)
     path = tmp_path / "bad_host_config.json"
     path.write_text(json.dumps(cfg), encoding="utf-8")
     return str(path)

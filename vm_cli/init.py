@@ -11,6 +11,7 @@ Usage:  vm-init [--config PATH] [--dir BASE] [--agents]
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -47,15 +48,15 @@ A local VM is available for running and testing code, driven by the `vm` CLI (on
 - `vm push <file>... <dest>` / `vm pull <remote> [local]` - copy files in/out
 - `vm sync <dir>` - bulk-upload a directory
 - `vm build-run <src>` - upload, compile, and run a source file (Linux)
-- `vm vm doctor` - health check; `vm vm reset` - restore the clean snapshot
+- `vm doctor` - health check; `vm reset` - restore the clean snapshot
 - `vm docs` - print the full usage reference (read this before first use)
 
 Config is `vmconfig.json` in this directory (created by `vm-init`). Tools placed in
 `provision/<vm>/` are auto-installed into the guest on first use and added to PATH.
 
 Rules: confine guest writes to an agreed directory; never run
-`vm vm revert/reset/stop/snapshot` unless explicitly asked or the VM is broken.
-If a command fails, run `vm vm doctor` before retrying; don't retry more than twice.
+`vm revert/reset/stop/snapshot` unless explicitly asked or the VM is broken.
+If a command fails, run `vm doctor` before retrying; don't retry more than twice.
 """
 
 
@@ -83,6 +84,7 @@ def ask_yes(msg, default=False):
 def ask_secret(msg):
     if sys.stdin.isatty():
         import getpass
+
         try:
             return getpass.getpass(msg + ": ")
         except (EOFError, KeyboardInterrupt):
@@ -100,11 +102,14 @@ def _enable_vt():
     if os.name == "nt":
         try:
             import ctypes
+
             k = ctypes.windll.kernel32
             h = k.GetStdHandle(-11)
             mode = ctypes.c_uint()
             if k.GetConsoleMode(h, ctypes.byref(mode)):
-                k.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                k.SetConsoleMode(
+                    h, mode.value | 0x0004
+                )  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
         except Exception:
             pass
 
@@ -153,12 +158,14 @@ def read_key():
     """Read one keystroke and normalize to up/down/space/enter/all/quit/''."""
     if os.name == "nt":
         import msvcrt
+
         ch = msvcrt.getch()
         if ch in (b"\x00", b"\xe0"):
             return {b"H": "up", b"P": "down"}.get(msvcrt.getch(), "")
         return _norm_key(ch)
     import termios
     import tty
+
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -232,6 +239,7 @@ def find_vmrun():
         if os.path.isfile(p):
             return p
     from shutil import which
+
     w = which("vmrun")
     if w:
         return w
@@ -301,8 +309,12 @@ def vmx_is_encrypted(vmrun, vmx, timeout=20):
     command, so init can prompt for the password before trying to read the IP.
     """
     try:
-        p = subprocess.run([vmrun, "checkToolsState", vmx],
-                           capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(
+            [vmrun, "checkToolsState", vmx],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
     except Exception:
         return False
     return "a password is required" in ((p.stderr or "") + (p.stdout or "")).lower()
@@ -311,13 +323,20 @@ def vmx_is_encrypted(vmrun, vmx, timeout=20):
 def get_ip(vmrun, vmx, enc_pw="", timeout=25):
     pre = ["-vp", enc_pw] if enc_pw else []
     try:
-        p = subprocess.run([vmrun] + pre + ["getGuestIPAddress", vmx, "-wait"],
-                           capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(
+            [vmrun] + pre + ["getGuestIPAddress", vmx],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
     except Exception:
         return None
     ip = (p.stdout or "").strip()
-    if p.returncode == 0 and ip and ip[0].isdigit():
-        return ip
+    if p.returncode == 0:
+        try:
+            return str(ipaddress.ip_address(ip))
+        except ValueError:
+            pass
     return None
 
 
@@ -325,8 +344,7 @@ def get_ip(vmrun, vmx, enc_pw="", timeout=25):
 def detect_default_wsl_distro():
     """Name of the default WSL distro, or None. Parses `wsl -l -v` (UTF-16)."""
     try:
-        p = subprocess.run(["wsl", "-l", "-v"],
-                           capture_output=True, timeout=15)
+        p = subprocess.run(["wsl", "-l", "-v"], capture_output=True, timeout=15)
     except Exception:
         return None
     if p.returncode != 0:
@@ -380,8 +398,7 @@ def collect_vm(vmrun, vmx, meta, running):
         print("  (VM not running; leaving host blank - use `vm ip --save` later)")
     host = ask("  host IP", host)
 
-    default_user = ask("  default_user",
-                       "IEUser" if os_type == "windows" else "user")
+    default_user = ask("  default_user", "IEUser" if os_type == "windows" else "user")
     password = ask_secret("  password for %s" % default_user)
     snapshot = ask("  clean snapshot name", "clean")
 
@@ -458,8 +475,9 @@ def write_agents(base, interactive, force):
         if "## Test VM" in cur:
             return None  # already present
     if not force:
-        if not interactive or not ask_yes("Append a 'Test VM' section to ./AGENTS.md?",
-                                          default=False):
+        if not interactive or not ask_yes(
+            "Append a 'Test VM' section to ./AGENTS.md?", default=False
+        ):
             return None
     sep = "" if not cur else ("\n" if cur.endswith("\n") else "\n\n")
     with open(path, "a", encoding="utf-8") as f:
@@ -469,15 +487,35 @@ def write_agents(base, interactive, force):
 
 # --- main --------------------------------------------------------------------
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="vm-init",
-                                 description="Interactive setup for the vm CLI")
-    ap.add_argument("--config", default=os.path.join(os.getcwd(), "vmconfig.json"),
-                    help="config path to write (default: ./vmconfig.json)")
-    ap.add_argument("--dir", default=os.getcwd(),
-                    help="base dir for staging/ and provision/ (default: current directory)")
-    ap.add_argument("--agents", action="store_true",
-                    help="append a 'Test VM' section to ./AGENTS.md without prompting")
+    ap = argparse.ArgumentParser(
+        prog="vm-init", description="Interactive setup for the vm CLI"
+    )
+    ap.add_argument(
+        "--config", help="config path to write (default: <dir>/vmconfig.json)"
+    )
+    ap.add_argument(
+        "--dir",
+        help="project directory (default: config's directory or current directory)",
+    )
+    ap.add_argument(
+        "--agents",
+        action="store_true",
+        help="append a 'Test VM' section to ./AGENTS.md without prompting",
+    )
     args = ap.parse_args(argv)
+    args.config = os.path.abspath(
+        args.config or os.path.join(args.dir or os.getcwd(), "vmconfig.json")
+    )
+    base = os.path.dirname(args.config)
+    if args.dir and os.path.normcase(os.path.abspath(args.dir)) != os.path.normcase(
+        base
+    ):
+        print(
+            "error: --dir must be the directory containing --config; staging/ and provision/ live beside it.",
+            file=sys.stderr,
+        )
+        return 125
+    args.dir = base
 
     vmrun = find_vmrun()
     if not vmrun:
@@ -490,8 +528,10 @@ def main(argv=None):
     running = vmrun_list_running(vmrun)
     available = set(running) | read_inventory()
     if not available:
-        print("No VMs found (none running and no inventory). Start a VM and re-run.",
-              file=sys.stderr)
+        print(
+            "No VMs found (none running and no inventory). Start a VM and re-run.",
+            file=sys.stderr,
+        )
         return 1
 
     # existing config -> merge into it
@@ -500,12 +540,29 @@ def main(argv=None):
         try:
             with open(args.config, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
+            if (
+                not isinstance(cfg, dict)
+                or not isinstance(cfg.get("vms", {}), dict)
+                or any(
+                    not isinstance(block, dict) for block in cfg.get("vms", {}).values()
+                )
+            ):
+                raise ValueError(
+                    "config must be an object with a 'vms' map of VM objects"
+                )
             cfg.setdefault("vms", {})
             cfg["vmrun"] = vmrun
-            print("Merging into existing config: %s (%d VM(s) already there)"
-                  % (args.config, len(cfg["vms"])))
-        except (OSError, ValueError):
-            print("warning: could not read existing config; starting fresh.")
+            print(
+                "Merging into existing config: %s (%d VM(s) already there)"
+                % (args.config, len(cfg["vms"]))
+            )
+        except (OSError, ValueError) as e:
+            print(
+                "error: cannot merge existing config %s: %s; repair it before running vm-init."
+                % (args.config, e),
+                file=sys.stderr,
+            )
+            return 125
 
     ordered = sorted(available, key=lambda p: default_name(p, read_vmx_meta(p)).lower())
     entries = [(vmx, read_vmx_meta(vmx)) for vmx in ordered]
@@ -558,7 +615,9 @@ def main(argv=None):
     cfg["default_vm"] = cur
 
     if os.path.isfile(args.config):
-        if not ask_yes("\nOverwrite %s with the merged config?" % args.config, default=True):
+        if not ask_yes(
+            "\nOverwrite %s with the merged config?" % args.config, default=True
+        ):
             print("Aborted; config not written.")
             return 0
     atomic_write_json(args.config, cfg)
@@ -577,11 +636,11 @@ def main(argv=None):
     win = [n for n in added if (cfg["vms"].get(n) or {}).get("os") == "windows"]
     print("\nNext:")
     for n in win:
-        print("  vm --vm %s vm setup-ssh   # enable OpenSSH in the guest" % n)
+        print("  vm --vm %s setup-ssh   # enable OpenSSH in the guest" % n)
     if win:
         print("  (a freshly-created Windows VM may need one reboot first so VMware")
         print("   Tools can launch programs; setup-ssh will tell you if so)")
-    print("  vm vm doctor")
+    print("  vm doctor")
     return 0
 
 

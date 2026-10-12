@@ -85,4 +85,4 @@ def test_wheel_ships_the_docs(tmp_path):
         for name in DOC_NAMES:
             member = "vm_cli/_docs/%s" % name
             assert member in names, "wheel is missing %s (got %s)" % (member, names)
-            assert z.read(member).decode("utf-8") == _read(os.path.join(_REPO_ROOT, name))
+            assert z.read(member).decode("utf-8").replace("\r\n", "\n") == _read(os.path.join(_REPO_ROOT, name))

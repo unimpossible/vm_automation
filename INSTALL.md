@@ -7,7 +7,7 @@ Install into the environment (ideally a venv) where your agent runs:
 pip install .                                # from this repo; installs `vm` and `vm-init`
 cd /path/to/your/project                     # where the agent works; config lives here
 vm-init                                      # interactive: pick VMs, writes config + folders
-vm vm doctor                                 # checks: config, vmrun, vmx, SSH, sudo
+vm doctor                                 # checks: config, vmrun, vmx, SSH, sudo
 ```
 
 `vm-init` discovers the VMs VMware knows about, auto-detects OS + IP, prompts for the rest, and
@@ -27,7 +27,7 @@ section into your project's `AGENTS.md`. Or add it to `CLAUDE.md` by hand:
 ## Test VM
 Drive the test VM with the `vm` CLI (on PATH), run from this project dir.
 Run `vm docs` once to read the verbs. Rules: confine guest writes to an agreed dir;
-never run `vm vm revert/reset/stop/snapshot` unless explicitly asked or your team wrecked the state.
+never run `vm revert/reset/stop/snapshot` unless explicitly asked or your team wrecked the state.
 ```
 
 **2. Skip permission prompts** — in `.claude/settings.json` (project) or `~/.claude/settings.json`:
@@ -39,7 +39,7 @@ never run `vm vm revert/reset/stop/snapshot` unless explicitly asked or your tea
 }
 ```
 To keep destructive host verbs behind a prompt, allowlist only safe ones instead
-(`Bash(vm run:*)`, `Bash(vm push:*)`, `pull:*`, `build-run:*`, `Bash(vm vm doctor)`, `vm vm ip:*`).
+(`Bash(vm run:*)`, `Bash(vm push:*)`, `pull:*`, `build-run:*`, `Bash(vm doctor)`, `vm ip:*`).
 
 **3. Install the recovery skill** — makes `/vm-recovery` available (snapshot → reset → sync loop).
 It ships inside the package, so no repo checkout is needed:
@@ -62,9 +62,9 @@ vm run "<cmd>"                      # run on VM; exit code = the command's own r
 vm push <file>... /remote/dir/      # upload file(s)
 vm pull /remote/file [local]        # download
 vm build-run <src.c|.sh|.py>        # upload + compile + run in one call
-Exit 125 = can't connect: run `vm vm ip --save`, retry once, then stop and report.
+Exit 125 = can't connect: run `vm ip --save`, retry once, then stop and report.
 Exit 124 = timeout: retry once with --timeout 300, then stop and report.
-Never run `vm vm revert/reset/stop/snapshot` unless the user asks.
+Never run `vm revert/reset/stop/snapshot` unless the user asks.
 Write only under /home/user/work/ on the VM. Never retry a failing command more than twice.
 ```
 
